@@ -4,8 +4,8 @@ This document defines the Phase 2 fidelity target for transcript import/export b
 
 ## Evidence Baseline
 
-- `src/transcripts.ts` exports only `agent-transcripts/**/*.jsonl` files plus `transcript-manifest.json` with `schemaVersion: 1`.
-- `src/transcripts.ts` import writes only those JSONL files back into `targetProject/agent-transcripts/...`.
+- `src/transcripts.ts` exports transcript/store/sidebar artifacts in `transcript-manifest.json` with `schemaVersion: 2`.
+- `src/transcripts.ts` import writes transcript files into `targetProject/agent-transcripts/...`, restores store artifacts into `~/.cursor/chats/<workspace_key>/<conversation_id>/store.db`, and attempts sidebar state merge into `state.vscdb`.
 - `~/.config/Cursor Nightly/User/globalStorage/state.vscdb` contains `ItemTable` and `cursorDiskKV`.
 - `ItemTable.key = "composer.composerHeaders"` is a large JSON object with `allComposers` entries. Sample fields observed locally: `composerId`, `name`, `subtitle`, `createdAt`, `lastUpdatedAt`, `hasUnreadMessages`, `isArchived`, `isDraft`, `unifiedMode`, `forceMode`, `subagentInfo.parentComposerId`.
 - `cursorDiskKV` contains many chat-scoped keys such as `composer.content.*`, `bubbleId:*`, and `agentKv:blob:*`.
@@ -23,9 +23,9 @@ This document defines the Phase 2 fidelity target for transcript import/export b
 | Area | Current behavior |
 | --- | --- |
 | Export discovery | `enumerateTranscriptFiles()` walks `agent-transcripts` and keeps `.jsonl` files under the configured size limit. |
-| Export payload | `executeExportTranscripts()` uploads raw UTF-8 JSONL file contents plus a v1 manifest keyed as `transcripts/<projectKey>/<relativePath>`. |
-| Import payload | `executeImportTranscripts()` maps source projects to local projects, then writes selected JSONL files into `agent-transcripts`. |
-| What is not touched | No `state.vscdb` reads, no `store.db` reads, no sidebar metadata capture, no chat payload capture, no cross-store identity mapping. |
+| Export payload | `executeExportTranscripts()` uploads transcript/store/sidebar artifacts with per-artifact checksums and conversation metadata in a v2 manifest. |
+| Import payload | `executeImportTranscripts()` maps source projects to local projects, preflights artifact integrity and destination mapping, then restores selected artifacts. |
+| What is still partial | Sidebar merge into `state.vscdb` is best-effort and can degrade with explicit warnings when payload/database access is unavailable. |
 
 ## Fidelity Matrix
 

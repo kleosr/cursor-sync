@@ -40,8 +40,8 @@ The following are always excluded from sync:
 
 ### 1. Create a GitHub Personal Access Token
 
-1. Go to [GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens).
-2. Create a new token with the **gist** scope (required for push, pull, and export).
+1. Go to [GitHub Settings > Developer settings > Personal access tokens > Fine-grained tokens](https://github.com/settings/personal-access-tokens/new).
+2. Create a fine-grained token and grant **Account permissions > Gists: Read and write**.
 3. Copy the token.
 
 ### 2. Configure the Extension
@@ -110,12 +110,13 @@ Commands such as Resolve Conflicts and Reset are available from the Command Pale
 
 ## Agent Transcript Export and Import
 
-- **Export**: Run **Cursor Sync: Export Agent Transcripts to Private Gist**. The extension exports selected `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` files and writes a `transcript-manifest.json` that records the source project, file checksum, and byte size for each transcript.
-- **Import**: Run **Cursor Sync: Import Agent Transcripts from Private Gist**. Each source project must be mapped to a local Cursor project before the selected transcript files are written into that project's `agent-transcripts/` directory.
-- **Fidelity guarantee**: Selected transcript JSONL files are preserved as exact UTF-8 bytes across export and import. Automated tests cover checksum-backed export, exact byte preservation for `user`, `assistant`, and `tool` transcript rows, and continued import compatibility for `schemaVersion: 1` manifests.
-- **Compatibility note**: Import currently tolerates higher manifest versions when they still include the existing `type`, `sourceProjects`, and `files` structure, but extra fidelity artifacts are ignored.
-- **Current limitation**: Transcript export/import does not yet capture or restore `~/.cursor/chats/**/store.db`, `state.vscdb`, sidebar composer headers, unread state, or recency metadata. Imported transcripts are therefore a file-level backup, not a guaranteed recreation of Cursor sidebar rows or full in-product chat rendering.
-- **Verification**: Use the manual playbook in [`docs/transcript-simulation-verification.md`](docs/transcript-simulation-verification.md) to validate checksum parity, byte-for-byte transcript equality, and the current simulation gaps.
+- **Export**: Run **Cursor Sync: Export Agent Transcripts to Private Gist**. The extension exports selected `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` files and writes a `transcript-manifest.json` (`schemaVersion: 2`) with transcript/store/sidebar artifact metadata and checksums.
+- **Import**: Run **Cursor Sync: Import Agent Transcripts from Private Gist**. Each source project is mapped to a local Cursor project, then selected conversation artifacts are restored with preflight validation before any writes.
+- **Deterministic restore mapping**: Store artifacts restore to `~/.cursor/chats/<workspace-key>/<conversation-id>/store.db` using explicit `sourceWorkspaceKey` metadata and import-time workspace mapping when needed, not project-folder heuristics.
+- **Sidebar/state behavior**: Sidebar metadata JSON sidecars are restored under `agent-transcripts/<conversation-id>/cursor-sidebar-metadata.json`, and import attempts to merge `composer.composerHeaders` into local `state.vscdb` when payload and DB are available.
+- **Fidelity guarantee**: Selected transcript JSONL files are preserved as exact UTF-8 bytes across export and import with checksum verification. Import remains backward compatible for `schemaVersion: 1` transcript-only manifests.
+- **Degraded restore visibility**: Completion output reports restored counts for transcript/store/sidebar/state merge and warns when sidebar state merge is partial or skipped.
+- **Verification**: Use [`docs/transcript-simulation-verification.md`](docs/transcript-simulation-verification.md) for checksum checks, path checks, and full-restore verification.
 
 ## Extension List Sync
 
