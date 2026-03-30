@@ -102,5 +102,13 @@ describe("transcripts", () => {
       const root = resolveProjectsRoot();
       expect(root).toBe(path.join(os.homedir(), ".cursor", "projects"));
     });
+
+    it("places projects root beside the canonical chats directory under .cursor", async () => {
+      const { resolveProjectsRoot } = await import("../src/transcripts.js");
+      const root = resolveProjectsRoot();
+      const cursorDir = path.dirname(root);
+      expect(cursorDir).toBe(path.join(os.homedir(), ".cursor"));
+      expect(path.join(cursorDir, "chats")).toBe(path.join(os.homedir(), ".cursor", "chats"));
+    });
   });
 });

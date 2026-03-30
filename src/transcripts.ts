@@ -45,6 +45,11 @@ export interface TranscriptFileEntry {
 }
 
 const execFile = promisify(execFileCallback);
+const execFileWithInput = execFile as (
+  command: string,
+  args: readonly string[] | undefined,
+  options: { input: string; maxBuffer: number }
+) => Promise<{ stdout: string; stderr: string }>;
 
 interface ExportConversationState {
   projectKey: string;
@@ -57,6 +62,10 @@ interface ExportConversationState {
   warnings: string[];
   storeArtifact?: string;
   sourceWorkspaceKey?: string;
+}
+
+interface ComposerHeadersPayload {
+  allComposers: Array<Record<string, unknown>>;
 }
 
 interface ExportProjectAccumulator {
@@ -87,6 +96,17 @@ interface RestorePreview {
   newFiles: RestoreOperation[];
   conflicts: RestoreOperation[];
   unchanged: RestoreOperation[];
+}
+
+interface ImportRestoreReport {
+  transcriptWritten: number;
+  storeWritten: number;
+  sidebarWritten: number;
+  stateDbMerged: number;
+  stateDbSkippedNoPayload: number;
+  stateDbSkippedNoDb: number;
+  statePartial: boolean;
+  warnings: string[];
 }
 
 export function resolveProjectsRoot(): string {
@@ -576,6 +596,9 @@ async function buildExportBundleV2(
       lastUpdatedAt,
       transcriptArtifacts: [...conversationState.transcriptArtifacts].sort(),
       storeArtifact: conversationState.storeArtifact,
+      ...(conversationState.sourceWorkspaceKey
+        ? { storeSourceWorkspaceKey: conversationState.sourceWorkspaceKey }
+        : {}),
       sidebarArtifact: sidebarArtifactKey,
       warnings: [...conversationState.warnings].sort(),
     });
@@ -707,15 +730,9 @@ async function importTranscriptBundleV1(
     selectedPaths.has(operation.absolutePath)
   );
 
-  await previewAndApplyImportPlan(
-    context,
-    selectedOperations,
-    "Import transcript files",
-    logger,
-    {
-      sidebarRestoreStagedOnly: false,
-    }
-  );
+  await previewAndApplyImportPlan(context, selectedOperations, "Import transcript files", logger, {
+    importRestoreReport: false,
+  });
 }
 
 async function importTranscriptBundleV2(
@@ -742,7 +759,7 @@ async function importTranscriptBundleV2(
       detail: [
         conversation.subtitle,
         conversation.storeArtifact ? "store snapshot included" : "store snapshot missing",
-        "sidebar metadata staged only",
+        "sidebar sidecar + state.vscdb merge when snapshot allows",
       ].join(" · "),
       picked: true,
     }));
@@ -763,8 +780,63 @@ async function importTranscriptBundleV2(
   const selectedConversationKeys = new Set(
     selectedConversations.map((conversation) => conversation.conversationKey)
   );
+
+  const chatsWorkspaceKeys = await listChatsWorkspaceKeys();
+  const { resolved: derivedWorkspace, ambiguousSources } = deriveStoreWorkspaceMapping(
+    manifest,
+    selectedConversationKeys,
+    projectMapping
+  );
+  let workspaceMapping = new Map<string, string>(derivedWorkspace);
+  const requiredStoreWorkspaceKeys = collectRequiredStoreWorkspaceKeys(
+    manifest,
+    selectedConversationKeys
+  );
+  const promptWorkspaceSources = new Set<string>(ambiguousSources);
+  for (const swk of requiredStoreWorkspaceKeys) {
+    if (chatsWorkspaceKeys.length > 0 && !chatsWorkspaceKeys.includes(swk)) {
+      promptWorkspaceSources.add(swk);
+    }
+  }
+  if (promptWorkspaceSources.size > 0) {
+    for (const swk of promptWorkspaceSources) {
+      workspaceMapping.delete(swk);
+    }
+    const prompted = await promptForWorkspaceMapping(
+      [...promptWorkspaceSources].sort(),
+      chatsWorkspaceKeys,
+      logger
+    );
+    if (prompted === null) {
+      return;
+    }
+    for (const [k, v] of prompted) {
+      workspaceMapping.set(k, v);
+    }
+  }
+
+  const preflightErrors: string[] = [];
+  for (const [conversationKey, conversation] of availableConversations) {
+    if (!selectedConversationKeys.has(conversationKey)) continue;
+    const targetProject = projectMapping.get(conversation.projectKey);
+    if (!targetProject) continue;
+    preflightErrors.push(
+      ...(await preflightV2ConversationImport({
+        gistData,
+        manifest,
+        conversation,
+        targetProject,
+        workspaceMapping,
+      }))
+    );
+  }
+
+  if (preflightErrors.length > 0) {
+    vscode.window.showErrorMessage(preflightErrors[0]!);
+    return;
+  }
+
   const operations: RestoreOperation[] = [];
-  const validationErrors: string[] = [];
   const stagedWarnings = new Set<string>();
 
   for (const [conversationKey, conversation] of availableConversations) {
@@ -786,37 +858,24 @@ async function importTranscriptBundleV2(
     for (const artifactId of artifactIds) {
       const artifactEntry = manifest.artifacts[artifactId];
       if (!artifactEntry) {
-        validationErrors.push(`Manifest is missing artifact metadata for ${artifactId}.`);
         continue;
       }
 
       const gistFile = gistData.files[syncKeyToGistFileName(artifactId)];
       if (!gistFile) {
-        validationErrors.push(`Bundle is missing ${artifactId}.`);
         continue;
       }
 
       const content = decodeTranscriptArtifact(gistFile.content, artifactEntry.encoding);
-      const checksum = computeArtifactChecksum(content);
-      if (checksum !== artifactEntry.checksum) {
-        validationErrors.push(`Checksum mismatch for ${artifactId}.`);
-        continue;
-      }
 
       operations.push({
-        absolutePath: resolveArtifactImportPath(targetProject, artifactEntry),
+        absolutePath: resolveArtifactImportPath(targetProject, artifactEntry, workspaceMapping),
         content,
-        checksum,
+        checksum: artifactEntry.checksum,
         syncKey: artifactId,
         kind: artifactEntry.kind,
         conversationId: artifactEntry.conversationId,
       });
-
-      if (artifactEntry.kind === "sidebar") {
-        stagedWarnings.add(
-          `${artifactEntry.conversationId}: sidebar metadata will be restored as JSON only; state.vscdb will not be modified.`
-        );
-      }
     }
 
     for (const warning of conversation.warnings) {
@@ -824,28 +883,15 @@ async function importTranscriptBundleV2(
     }
   }
 
-  if (validationErrors.length > 0) {
-    vscode.window.showErrorMessage(
-      `Import failed: ${validationErrors.slice(0, 3).join(" ")}`
-    );
-    return;
-  }
-
   if (operations.length === 0) {
     vscode.window.showInformationMessage("No bundle artifacts to restore after selection.");
     return;
   }
 
-  await previewAndApplyImportPlan(
-    context,
-    operations,
-    "Import conversation bundle",
-    logger,
-    {
-      sidebarRestoreStagedOnly: true,
-      warnings: [...stagedWarnings].sort(),
-    }
-  );
+  await previewAndApplyImportPlan(context, operations, "Import conversation bundle", logger, {
+    importRestoreReport: true,
+    warnings: [...stagedWarnings].sort(),
+  });
 }
 
 async function promptForProjectMapping(
@@ -903,7 +949,7 @@ async function previewAndApplyImportPlan(
   actionLabel: string,
   logger: ReturnType<typeof getLogger>,
   options: {
-    sidebarRestoreStagedOnly: boolean;
+    importRestoreReport: boolean;
     warnings?: string[];
   }
 ): Promise<void> {
@@ -979,20 +1025,36 @@ async function previewAndApplyImportPlan(
     return;
   }
 
+  let report: ImportRestoreReport | undefined;
+  if (options.importRestoreReport) {
+    const sidebarOps = toWrite.filter((op) => op.kind === "sidebar");
+    report = buildImportRestoreReportFromOperations(toWrite);
+    if (sidebarOps.length > 0) {
+      const stateOutcome = await applySidebarStateRestoration(context, sidebarOps, logger);
+      report = mergeStateOutcomeIntoReport(report, stateOutcome);
+    }
+  }
+
+  const warningParts = [
+    ...(options.warnings ?? []),
+    ...(report?.warnings ?? []),
+  ];
   const warningSuffix =
-    options.warnings && options.warnings.length > 0
-      ? ` Warnings: ${options.warnings.slice(0, 3).join(" ")}`
-      : "";
-  const sidebarSuffix = options.sidebarRestoreStagedOnly
-    ? " Sidebar metadata was restored as JSON sidecars only."
+    warningParts.length > 0 ? ` Warnings: ${warningParts.slice(0, 5).join(" ")}` : "";
+
+  const detailSuffix = report
+    ? ` Restored: transcript files ${report.transcriptWritten}, store.db ${report.storeWritten}, sidebar JSON ${report.sidebarWritten}, state.vscdb merges ${report.stateDbMerged}. Skipped state merge (no composer payload) ${report.stateDbSkippedNoPayload}, (no DB) ${report.stateDbSkippedNoDb}.${report.statePartial ? " Partial state/sidebar restoration." : ""}`
     : "";
 
   vscode.window.showInformationMessage(
     `Transcript import complete: ${result.writtenCount} artifact(s) written, ${preview.unchanged.length} unchanged, ` +
-      `${conflictPolicy === "skip" ? preview.conflicts.length : 0} conflict(s) skipped.${sidebarSuffix}${warningSuffix}`
+      `${conflictPolicy === "skip" ? preview.conflicts.length : 0} conflict(s) skipped.${detailSuffix}${warningSuffix}`
   );
   logger.appendLine(
-    `[${new Date().toISOString()}] Transcript import succeeded: ${result.writtenCount} artifacts`
+    `[${new Date().toISOString()}] Transcript import succeeded: ${result.writtenCount} artifacts` +
+      (report
+        ? `; transcript=${report.transcriptWritten} store=${report.storeWritten} sidebar=${report.sidebarWritten} stateMerged=${report.stateDbMerged}`
+        : "")
   );
 }
 
@@ -1081,6 +1143,27 @@ async function buildSidebarMetadataSnapshot(
   );
   const evidence = await extractSidebarStateEvidence(conversationState.conversationId);
 
+  let composerHeadersRestore: unknown;
+  if (evidence?.stateDbPath) {
+    const rows = await querySqliteRows(
+      evidence.stateDbPath,
+      "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders' LIMIT 1;"
+    );
+    const raw = rows[0]?.value;
+    if (raw != null) {
+      composerHeadersRestore = coerceSqliteValue(raw);
+    }
+  }
+  const fallbackComposerHeaders = buildFallbackComposerHeadersPayload(
+    conversationState.conversationId,
+    summary,
+    exportedAt
+  );
+  const composerHeadersPayload =
+    composerHeadersRestore && typeof composerHeadersRestore === "object"
+      ? (composerHeadersRestore as Record<string, unknown>)
+      : fallbackComposerHeaders;
+
   return {
     schemaVersion: 1,
     snapshotType: "cursor-sidebar-metadata",
@@ -1101,7 +1184,32 @@ async function buildSidebarMetadataSnapshot(
     matchedItemTableRows: evidence?.matchedItemTableRows ?? [],
     matchedCursorDiskRows: evidence?.matchedCursorDiskRows ?? [],
     composerSummaryRows: evidence?.composerSummaryRows ?? [],
+    composerHeaders: composerHeadersPayload,
+    composerHeadersRestore: composerHeadersRestore ?? null,
     warnings: [...conversationState.warnings].sort(),
+  };
+}
+
+function buildFallbackComposerHeadersPayload(
+  conversationId: string,
+  summary: ReturnType<typeof summarizeTranscriptForSidebar>,
+  exportedAt: string
+): ComposerHeadersPayload {
+  const timestamp = summary.lastUpdatedAt ?? exportedAt;
+  return {
+    allComposers: [
+      {
+        composerId: conversationId,
+        name: summary.title,
+        subtitle: summary.subtitle,
+        lastUpdatedAt: timestamp,
+        lastOpenedAt: timestamp,
+        createdAt: timestamp,
+        hasUnreadMessages: false,
+        isArchived: false,
+        isDraft: false,
+      },
+    ],
   };
 }
 
@@ -1160,7 +1268,7 @@ async function querySqliteRows(
   sql: string
 ): Promise<Array<Record<string, unknown>>> {
   try {
-    const { stdout } = await execFile("sqlite3", ["-json", dbPath, sql]);
+    const { stdout } = await runSqliteQuery(dbPath, sql);
     const trimmed = stdout.trim();
     if (!trimmed) {
       return [];
@@ -1173,6 +1281,71 @@ async function querySqliteRows(
   } catch {
     return [];
   }
+}
+
+async function runSqliteQuery(
+  dbPath: string,
+  sql: string
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await execFile("sqlite3", ["-json", dbPath, sql]);
+  } catch (error) {
+    if (!isCommandMissingError(error, "sqlite3")) {
+      throw error;
+    }
+    const pyScript = [
+      "import json, sqlite3, sys",
+      "db_path = sys.argv[1]",
+      "sql = sys.argv[2]",
+      "conn = sqlite3.connect(db_path)",
+      "conn.row_factory = sqlite3.Row",
+      "cur = conn.cursor()",
+      "cur.execute(sql)",
+      "def _coerce(v):",
+      "    if isinstance(v, (bytes, bytearray, memoryview)):",
+      "        return bytes(v).hex()",
+      "    return v",
+      "rows = [{k: _coerce(r[k]) for k in r.keys()} for r in cur.fetchall()]",
+      "print(json.dumps(rows))",
+      "conn.close()",
+    ].join(";");
+    return execFile("python3", ["-c", pyScript, dbPath, sql], {
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  }
+}
+
+async function runSqliteScript(dbPath: string, script: string): Promise<void> {
+  try {
+    await execFileWithInput("sqlite3", [dbPath], { input: script, maxBuffer: 64 * 1024 * 1024 });
+    return;
+  } catch (error) {
+    if (!isCommandMissingError(error, "sqlite3")) {
+      throw error;
+    }
+    const pyScript = [
+      "import sqlite3, sys",
+      "db_path = sys.argv[1]",
+      "sql_script = sys.stdin.read()",
+      "conn = sqlite3.connect(db_path)",
+      "cur = conn.cursor()",
+      "cur.executescript(sql_script)",
+      "conn.commit()",
+      "conn.close()",
+    ].join(";");
+    await execFileWithInput("python3", ["-c", pyScript, dbPath], {
+      input: script,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  }
+}
+
+function isCommandMissingError(error: unknown, command: string): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const msg = error.message;
+  return msg.includes(`spawn ${command} ENOENT`) || msg.includes(`'${command}' not found`);
 }
 
 function coerceSqliteValue(value: unknown): unknown {
@@ -1251,6 +1424,536 @@ function resolveChatsRoot(): string {
   return path.join(os.homedir(), ".cursor", "chats");
 }
 
+function collectRequiredStoreWorkspaceKeys(
+  manifest: TranscriptManifestV2,
+  selectedConversationKeys: Set<string>
+): string[] {
+  const keys = new Set<string>();
+  for (const [conversationKey, conv] of Object.entries(manifest.conversations)) {
+    if (!selectedConversationKeys.has(conversationKey)) {
+      continue;
+    }
+    if (!conv.storeArtifact) {
+      continue;
+    }
+    const storeEntry = manifest.artifacts[conv.storeArtifact];
+    const swk = storeEntry?.sourceWorkspaceKey;
+    if (typeof swk === "string" && swk.length > 0) {
+      keys.add(swk);
+    }
+  }
+  return [...keys].sort((a, b) => a.localeCompare(b));
+}
+
+function deriveStoreWorkspaceMapping(
+  manifest: TranscriptManifestV2,
+  selectedConversationKeys: Set<string>,
+  projectMapping: ReadonlyMap<string, ProjectInfo>
+): { resolved: Map<string, string>; ambiguousSources: string[] } {
+  const targetsBySource = new Map<string, Set<string>>();
+  for (const [conversationKey, conv] of Object.entries(manifest.conversations)) {
+    if (!selectedConversationKeys.has(conversationKey)) {
+      continue;
+    }
+    if (!conv.storeArtifact) {
+      continue;
+    }
+    const storeEntry = manifest.artifacts[conv.storeArtifact];
+    const swk = storeEntry?.sourceWorkspaceKey;
+    if (typeof swk !== "string" || swk.length === 0) {
+      continue;
+    }
+    const tp = projectMapping.get(conv.projectKey);
+    if (!tp) {
+      continue;
+    }
+    const set = targetsBySource.get(swk) ?? new Set<string>();
+    set.add(tp.folderName);
+    targetsBySource.set(swk, set);
+  }
+  const resolved = new Map<string, string>();
+  const ambiguousSources: string[] = [];
+  for (const [swk, set] of [...targetsBySource.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    if (set.size === 1) {
+      resolved.set(swk, [...set][0]!);
+    } else {
+      ambiguousSources.push(swk);
+    }
+  }
+  return { resolved, ambiguousSources };
+}
+
+async function listChatsWorkspaceKeys(): Promise<string[]> {
+  const root = resolveChatsRoot();
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function isSafeWorkspaceKeySegment(key: string): boolean {
+  if (key.length === 0 || key === "." || key === "..") return false;
+  if (key.includes("/") || key.includes("\\") || key.includes("\0")) return false;
+  return true;
+}
+
+async function promptForWorkspaceMapping(
+  sourceWorkspaceKeys: string[],
+  chatsWorkspaceKeys: string[],
+  logger: ReturnType<typeof getLogger>
+): Promise<Map<string, string> | null> {
+  if (sourceWorkspaceKeys.length === 0) {
+    return new Map();
+  }
+
+  const mapping = new Map<string, string>();
+
+  for (const src of sourceWorkspaceKeys) {
+    const picks: vscode.QuickPickItem[] = [
+      ...chatsWorkspaceKeys.map((k) => ({ label: k, description: k })),
+      { label: "Enter custom workspace key…", description: "__custom__" },
+    ];
+    picks.unshift({ label: "(Cancel import)", description: "__cancel__" });
+
+    const selected = await vscode.window.showQuickPick(picks, {
+      title: `Map source chats workspace "${src}" to a local ~/.cursor/chats subdirectory`,
+      placeHolder: "Select the destination workspace key for store.db restoration",
+    });
+
+    if (!selected || selected.description === "__cancel__") {
+      logger.appendLine(
+        `[${new Date().toISOString()}] Transcript import cancelled during workspace mapping`
+      );
+      return null;
+    }
+
+    if (selected.description === "__custom__") {
+      const raw = await vscode.window.showInputBox({
+        prompt: `Target workspace key for source "${src}" (single directory name under ~/.cursor/chats/)`,
+        validateInput: (v) => {
+          if (!v || !isSafeWorkspaceKeySegment(v.trim())) {
+            return "Use one non-empty path segment without slashes.";
+          }
+          return undefined;
+        },
+      });
+      if (raw === undefined) {
+        return null;
+      }
+      mapping.set(src, raw.trim());
+    } else if (selected.description) {
+      mapping.set(src, selected.description);
+    }
+  }
+
+  return mapping;
+}
+
+async function preflightV2ConversationImport(params: {
+  gistData: GistResponse;
+  manifest: TranscriptManifestV2;
+  conversation: TranscriptBundleConversationEntry;
+  targetProject: ProjectInfo;
+  workspaceMapping: ReadonlyMap<string, string>;
+}): Promise<string[]> {
+  const { gistData, manifest, conversation, targetProject, workspaceMapping } = params;
+  const errors: string[] = [];
+
+  const artifactIds = [
+    ...conversation.transcriptArtifacts,
+    conversation.sidebarArtifact,
+    ...(conversation.storeArtifact ? [conversation.storeArtifact] : []),
+  ];
+
+  for (const artifactId of artifactIds) {
+    const entry = manifest.artifacts[artifactId];
+    if (!entry) {
+      errors.push(`Import preflight failed: Missing manifest entry for "${artifactId}".`);
+      continue;
+    }
+
+    const gistFile = gistData.files[syncKeyToGistFileName(artifactId)];
+    if (!gistFile) {
+      errors.push(`Import preflight failed: Bundle file missing for "${artifactId}".`);
+      continue;
+    }
+
+    let content: Buffer;
+    try {
+      content = decodeTranscriptArtifact(gistFile.content, entry.encoding);
+    } catch {
+      errors.push(`Import preflight failed: Failed to decode artifact "${artifactId}".`);
+      continue;
+    }
+
+    const checksum = computeArtifactChecksum(content);
+    if (checksum !== entry.checksum) {
+      errors.push(`Import preflight failed: Checksum mismatch for "${artifactId}".`);
+    }
+
+    if (entry.kind === "store") {
+      const swk = entry.sourceWorkspaceKey;
+      if (typeof swk !== "string" || swk.length === 0) {
+        errors.push(
+          `Import preflight failed: Store "${artifactId}" has no sourceWorkspaceKey; re-export with Cursor Sync or deselect this conversation.`
+        );
+      } else {
+        const mapped = workspaceMapping.get(swk);
+        if (typeof mapped !== "string" || mapped.length === 0) {
+          errors.push(
+            `Import preflight failed: Store "${artifactId}": map source workspace "${swk}" to a local chats key.`
+          );
+        } else if (!isSafeWorkspaceKeySegment(mapped)) {
+          errors.push(
+            `Import preflight failed: Store destination workspace key "${mapped}" is not a safe path segment.`
+          );
+        } else {
+          const parent = path.join(resolveChatsRoot(), mapped);
+          try {
+            await fs.mkdir(parent, { recursive: true });
+          } catch {
+            errors.push(
+              `Import preflight failed: Cannot create or access chats directory "${parent}" for store restore.`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  try {
+    await fs.access(targetProject.fullPath);
+  } catch {
+    errors.push(`Import preflight failed: Target project directory missing: ${targetProject.fullPath}.`);
+  }
+
+  try {
+    await fs.mkdir(resolveChatsRoot(), { recursive: true });
+  } catch {
+    errors.push(`Import preflight failed: Cannot access chats root ${resolveChatsRoot()}.`);
+  }
+
+  return errors;
+}
+
+function buildImportRestoreReportFromOperations(operations: RestoreOperation[]): ImportRestoreReport {
+  const transcript = operations.filter((o) => o.kind === "transcript").length;
+  const store = operations.filter((o) => o.kind === "store").length;
+  const sidebar = operations.filter((o) => o.kind === "sidebar").length;
+  return {
+    transcriptWritten: transcript,
+    storeWritten: store,
+    sidebarWritten: sidebar,
+    stateDbMerged: 0,
+    stateDbSkippedNoPayload: 0,
+    stateDbSkippedNoDb: 0,
+    statePartial: false,
+    warnings: [],
+  };
+}
+
+interface StateRestoreOutcome {
+  stateDbMerged: number;
+  stateDbSkippedNoPayload: number;
+  stateDbSkippedNoDb: number;
+  statePartial: boolean;
+  warnings: string[];
+}
+
+function mergeStateOutcomeIntoReport(
+  base: ImportRestoreReport,
+  state: StateRestoreOutcome
+): ImportRestoreReport {
+  return {
+    ...base,
+    stateDbMerged: state.stateDbMerged,
+    stateDbSkippedNoPayload: state.stateDbSkippedNoPayload,
+    stateDbSkippedNoDb: state.stateDbSkippedNoDb,
+    statePartial: base.statePartial || state.statePartial,
+    warnings: [...base.warnings, ...state.warnings],
+  };
+}
+
+function escapeSqlLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+function parseComposerHeadersBlob(raw: string | undefined): {
+  allComposers: Array<Record<string, unknown>>;
+} {
+  if (!raw) {
+    return { allComposers: [] };
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      Array.isArray((parsed as Record<string, unknown>).allComposers)
+    ) {
+      return {
+        allComposers: (parsed as { allComposers: Array<Record<string, unknown>> }).allComposers,
+      };
+    }
+  } catch {}
+  return { allComposers: [] };
+}
+
+function getComposerId(record: Record<string, unknown>): string {
+  const id = record.composerId;
+  return typeof id === "string" && id.length > 0 ? id : "";
+}
+
+function mergeComposerHeadersAdditive(
+  existing: { allComposers: Array<Record<string, unknown>> },
+  imported: Record<string, unknown>
+): { allComposers: Array<Record<string, unknown>> } {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const c of existing.allComposers) {
+    const id = getComposerId(c);
+    if (id) {
+      byId.set(id, { ...c });
+    }
+  }
+  const importedList = Array.isArray(imported.allComposers) ? imported.allComposers : [];
+  for (const c of importedList) {
+    if (!c || typeof c !== "object" || Array.isArray(c)) {
+      continue;
+    }
+    const rec = c as Record<string, unknown>;
+    const id = getComposerId(rec);
+    if (!id || byId.has(id)) {
+      continue;
+    }
+    byId.set(id, { ...rec });
+  }
+  return { allComposers: [...byId.values()] };
+}
+
+function mergeComposerHeadersChain(
+  existingRaw: string | undefined,
+  importedPayloads: Array<Record<string, unknown>>
+): { allComposers: Array<Record<string, unknown>> } {
+  let acc = parseComposerHeadersBlob(existingRaw);
+  for (const imp of importedPayloads) {
+    acc = mergeComposerHeadersAdditive(acc, imp);
+  }
+  return acc;
+}
+
+function extractComposerHeadersPayload(
+  parsed: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const ch = parsed.composerHeaders;
+  if (ch && typeof ch === "object" && !Array.isArray(ch)) {
+    return ch as Record<string, unknown>;
+  }
+  const cr = parsed.composerHeadersRestore;
+  if (cr && typeof cr === "object" && !Array.isArray(cr)) {
+    return cr as Record<string, unknown>;
+  }
+  const rows = parsed.matchedItemTableRows;
+  if (Array.isArray(rows)) {
+    for (const row of rows) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) {
+        continue;
+      }
+      const rec = row as Record<string, unknown>;
+      if (rec.key !== "composer.composerHeaders") {
+        continue;
+      }
+      const v = rec.value;
+      if (typeof v === "string") {
+        const t = v.trim();
+        if (t.endsWith("…") || t.endsWith("...")) {
+          return undefined;
+        }
+        try {
+          const parsedInner = JSON.parse(t) as unknown;
+          if (parsedInner && typeof parsedInner === "object" && !Array.isArray(parsedInner)) {
+            return parsedInner as Record<string, unknown>;
+          }
+        } catch {
+          return undefined;
+        }
+      }
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        return v as Record<string, unknown>;
+      }
+    }
+  }
+  return undefined;
+}
+
+function deriveComposerHeadersPayloadFromSidebarSnapshot(
+  parsed: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const conversationId = parsed.conversationId;
+  if (typeof conversationId !== "string" || conversationId.trim().length === 0) {
+    return undefined;
+  }
+  const title = typeof parsed.title === "string" && parsed.title.trim().length > 0
+    ? parsed.title
+    : conversationId;
+  const subtitle = typeof parsed.subtitle === "string" ? parsed.subtitle : "";
+  const rawTimestamp = parsed.lastUpdatedAt;
+  const timestamp =
+    typeof rawTimestamp === "string" && rawTimestamp.trim().length > 0
+      ? rawTimestamp
+      : new Date().toISOString();
+  return {
+    allComposers: [
+      {
+        composerId: conversationId,
+        name: title,
+        subtitle,
+        lastUpdatedAt: timestamp,
+        lastOpenedAt: timestamp,
+        createdAt: timestamp,
+        hasUnreadMessages: false,
+        isArchived: false,
+        isDraft: false,
+      },
+    ],
+  };
+}
+
+async function resolveSidebarImportStateDbPaths(
+  parsed: Record<string, unknown>
+): Promise<{ paths: string[]; usedFallback: boolean }> {
+  const sp = parsed.stateDbPath;
+  if (typeof sp === "string" && sp.length > 0) {
+    try {
+      await fs.access(sp);
+      return { paths: [sp], usedFallback: false };
+    } catch {
+      const candidates = await resolveStateDbCandidates();
+      if (candidates.length > 0) {
+        return { paths: [candidates[0]!], usedFallback: true };
+      }
+      return { paths: [], usedFallback: false };
+    }
+  }
+  const candidates = await resolveStateDbCandidates();
+  return { paths: candidates.length > 0 ? [candidates[0]!] : [], usedFallback: false };
+}
+
+async function applySidebarStateRestoration(
+  context: vscode.ExtensionContext,
+  sidebarOps: RestoreOperation[],
+  logger: ReturnType<typeof getLogger>
+): Promise<StateRestoreOutcome> {
+  const outcome: StateRestoreOutcome = {
+    stateDbMerged: 0,
+    stateDbSkippedNoPayload: 0,
+    stateDbSkippedNoDb: 0,
+    statePartial: false,
+    warnings: [],
+  };
+
+  type Agg = { payloads: Array<Record<string, unknown>>; conversationIds: string[] };
+  const byDb = new Map<string, Agg>();
+
+  for (const op of sidebarOps) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(op.content.toString("utf-8")) as Record<string, unknown>;
+    } catch {
+      outcome.warnings.push(`Sidebar ${op.conversationId ?? "?"}: invalid JSON; state.vscdb unchanged.`);
+      outcome.statePartial = true;
+      continue;
+    }
+
+    const payload = extractComposerHeadersPayload(parsed);
+    const effectivePayload = payload ?? deriveComposerHeadersPayloadFromSidebarSnapshot(parsed);
+    if (!effectivePayload) {
+      outcome.stateDbSkippedNoPayload += 1;
+      continue;
+    }
+
+    const { paths, usedFallback } = await resolveSidebarImportStateDbPaths(parsed);
+    if (paths.length === 0) {
+      outcome.stateDbSkippedNoDb += 1;
+      outcome.warnings.push(
+        `Sidebar ${op.conversationId ?? "?"}: state.vscdb not found; only sidebar JSON was written.`
+      );
+      outcome.statePartial = true;
+      continue;
+    }
+
+    if (typeof parsed.stateDbPath === "string" && parsed.stateDbPath.length > 0 && usedFallback) {
+      outcome.warnings.push(
+        `Sidebar ${op.conversationId ?? "?"}: exported stateDbPath unavailable; used default state.vscdb (partial).`
+      );
+      outcome.statePartial = true;
+    }
+
+    const dbPath = paths[0]!;
+    const agg = byDb.get(dbPath) ?? { payloads: [], conversationIds: [] };
+    agg.payloads.push(effectivePayload);
+    if (op.conversationId) {
+      agg.conversationIds.push(op.conversationId);
+    }
+    byDb.set(dbPath, agg);
+  }
+
+  for (const [dbPath, agg] of byDb) {
+    let existingRaw: string | undefined;
+    try {
+      const rows = await querySqliteRows(
+        dbPath,
+        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders' LIMIT 1;"
+      );
+      const v = rows[0]?.value;
+      if (typeof v === "string") {
+        existingRaw = v;
+      } else if (v != null && typeof v === "object") {
+        existingRaw = JSON.stringify(v);
+      }
+    } catch {
+      outcome.warnings.push(`State DB ${dbPath}: read failed; merge skipped.`);
+      outcome.statePartial = true;
+      continue;
+    }
+
+    const merged = mergeComposerHeadersChain(existingRaw, agg.payloads);
+    const existingComposerCount = parseComposerHeadersBlob(existingRaw).allComposers.length;
+    const mergedComposerCount = merged.allComposers.length;
+    const mergedJson = JSON.stringify(merged);
+    const prior = JSON.stringify(parseComposerHeadersBlob(existingRaw));
+    if (mergedJson === prior) {
+      outcome.stateDbMerged += 1;
+      continue;
+    }
+
+    const { entries: backupEntries } = await createBackup(context, [dbPath]);
+    try {
+      const esc = escapeSqlLiteral(mergedJson);
+      const script = `BEGIN IMMEDIATE;\nUPDATE ItemTable SET value = '${esc}' WHERE key = 'composer.composerHeaders';\nINSERT INTO ItemTable (key, value) SELECT 'composer.composerHeaders', '${esc}' WHERE NOT EXISTS (SELECT 1 FROM ItemTable WHERE key = 'composer.composerHeaders');\nCOMMIT;\n`;
+      await runSqliteScript(dbPath, script);
+      outcome.stateDbMerged += 1;
+      logger.appendLine(
+        `[${new Date().toISOString()}] Merged composer.composerHeaders in ${dbPath} for ${agg.conversationIds.join(",")}`
+      );
+    } catch (error) {
+      await rollbackFromBackup(backupEntries);
+      outcome.warnings.push(
+        `State DB ${dbPath}: write failed (${error instanceof Error ? error.message : String(error)}); rolled back.`
+      );
+      outcome.statePartial = true;
+    }
+  }
+
+  return outcome;
+}
+
 async function findStoreDbForConversation(
   conversationId: string
 ): Promise<{ absolutePath: string; workspaceKey: string } | undefined> {
@@ -1283,7 +1986,8 @@ async function findStoreDbForConversation(
 
 function resolveArtifactImportPath(
   targetProject: ProjectInfo,
-  artifactEntry: TranscriptBundleArtifactEntry
+  artifactEntry: TranscriptBundleArtifactEntry,
+  workspaceMapping: ReadonlyMap<string, string>
 ): string {
   if (artifactEntry.kind === "transcript") {
     const relativePath =
@@ -1293,12 +1997,10 @@ function resolveArtifactImportPath(
   }
 
   if (artifactEntry.kind === "store") {
-    return path.join(
-      resolveChatsRoot(),
-      targetProject.folderName,
-      artifactEntry.conversationId,
-      "store.db"
-    );
+    const swk = artifactEntry.sourceWorkspaceKey;
+    const mapped =
+      typeof swk === "string" && swk.length > 0 ? workspaceMapping.get(swk) ?? "" : "";
+    return path.join(resolveChatsRoot(), mapped, artifactEntry.conversationId, "store.db");
   }
 
   return path.join(

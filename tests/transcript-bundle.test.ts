@@ -157,4 +157,33 @@ describe("transcript bundle helpers", () => {
       "subagents/child.jsonl"
     );
   });
+
+  it("uses deterministic artifact sync key paths for transcript store and sidebar kinds", () => {
+    const projectKey = "home-user-dev-app";
+    const conversationId = "conv-aaa";
+    expect(bundleArtifactSyncKey(projectKey, conversationId, "transcript", "conv-aaa.jsonl")).toBe(
+      `artifacts/${projectKey}/${conversationId}/transcript/conv-aaa.jsonl`
+    );
+    expect(bundleArtifactSyncKey(projectKey, conversationId, "store", "store.db")).toBe(
+      `artifacts/${projectKey}/${conversationId}/store/store.db`
+    );
+    expect(
+      bundleArtifactSyncKey(projectKey, conversationId, "sidebar", "sidebar-metadata.json")
+    ).toBe(`artifacts/${projectKey}/${conversationId}/sidebar/sidebar-metadata.json`);
+  });
+
+  it("sorts canonical v2 artifact sync keys lexicographically by kind segment", () => {
+    const projectKey = "p";
+    const conversationId = "c";
+    const keys = [
+      bundleArtifactSyncKey(projectKey, conversationId, "transcript", "c.jsonl"),
+      bundleArtifactSyncKey(projectKey, conversationId, "store", "store.db"),
+      bundleArtifactSyncKey(projectKey, conversationId, "sidebar", "sidebar-metadata.json"),
+    ].sort((a, b) => a.localeCompare(b));
+    expect(keys).toEqual([
+      `artifacts/${projectKey}/${conversationId}/sidebar/sidebar-metadata.json`,
+      `artifacts/${projectKey}/${conversationId}/store/store.db`,
+      `artifacts/${projectKey}/${conversationId}/transcript/c.jsonl`,
+    ]);
+  });
 });

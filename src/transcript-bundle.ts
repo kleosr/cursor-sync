@@ -55,6 +55,7 @@ export interface TranscriptBundleConversationEntry {
   lastUpdatedAt: string;
   transcriptArtifacts: string[];
   storeArtifact?: string;
+  storeSourceWorkspaceKey?: string;
   sidebarArtifact: string;
   warnings: string[];
 }
