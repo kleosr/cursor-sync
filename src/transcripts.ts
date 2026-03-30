@@ -1,13 +1,36 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import * as crypto from "node:crypto";
 import * as os from "node:os";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { GistClient } from "./gist.js";
 import { requireToken, getToken } from "./auth.js";
 import { withRetry } from "./retry.js";
 import { getLogger } from "./diagnostics.js";
+import { createBackup, pruneOldBackups, rollbackFromBackup } from "./rollback.js";
 import type { GistResponse } from "./types.js";
+import {
+  TRANSCRIPT_MANIFEST_FILE_NAME,
+  bundleArtifactSyncKey,
+  computeArtifactChecksum,
+  computeTranscriptMachineId,
+  decodeTranscriptArtifact,
+  encodeTranscriptArtifact,
+  getConversationIdFromRelativePath,
+  getConversationScopedRelativePath,
+  gistFileNameToSyncKey,
+  isTranscriptManifestV2,
+  parseTranscriptBundleManifest,
+  summarizeTranscriptForSidebar,
+  syncKeyToGistFileName,
+  type TranscriptBundleArtifactEntry,
+  type TranscriptBundleArtifactKind,
+  type TranscriptBundleConversationEntry,
+  type TranscriptBundleSourceProjectInfo,
+  type TranscriptManifestV1,
+  type TranscriptManifestV2,
+} from "./transcript-bundle.js";
 
 export interface ProjectInfo {
   folderName: string;
@@ -21,25 +44,49 @@ export interface TranscriptFileEntry {
   projectKey: string;
 }
 
-export interface TranscriptManifest {
-  schemaVersion: 1;
-  type: "agent-transcripts";
-  createdAt: string;
-  sourceMachineId: string;
-  sourceOS: string;
-  sourceProjects: Record<string, TranscriptProjectInfo>;
-  files: Record<string, TranscriptManifestFileEntry>;
+const execFile = promisify(execFileCallback);
+
+interface ExportConversationState {
+  projectKey: string;
+  conversationId: string;
+  transcriptArtifacts: string[];
+  transcriptRelativePaths: string[];
+  primaryTranscriptContent: string;
+  primaryTranscriptSelectedAt: string;
+  lastUpdatedAt: string;
+  warnings: string[];
+  storeArtifact?: string;
+  sourceWorkspaceKey?: string;
 }
 
-export interface TranscriptProjectInfo {
+interface ExportProjectAccumulator {
   folderName: string;
   fileCount: number;
+  conversationIds: Set<string>;
+  artifactCount: number;
 }
 
-export interface TranscriptManifestFileEntry {
-  projectKey: string;
+interface SidebarStateEvidence {
+  stateDbPath: string;
+  extraction: "state-db-match" | "state-db-unmatched";
+  matchedItemTableRows: Array<{ key: string; value: unknown }>;
+  matchedCursorDiskRows: Array<{ key: string; value: unknown }>;
+  composerSummaryRows: Array<{ key: string; valueLength: number }>;
+}
+
+interface RestoreOperation {
+  absolutePath: string;
+  content: Buffer;
   checksum: string;
-  sizeBytes: number;
+  syncKey: string;
+  kind: TranscriptBundleArtifactKind;
+  conversationId?: string;
+}
+
+interface RestorePreview {
+  newFiles: RestoreOperation[];
+  conflicts: RestoreOperation[];
+  unchanged: RestoreOperation[];
 }
 
 export function resolveProjectsRoot(): string {
@@ -121,23 +168,6 @@ async function walkDir(dir: string): Promise<string[]> {
     }
   }
   return results;
-}
-
-function transcriptSyncKey(projectKey: string, relativePath: string): string {
-  return `transcripts/${projectKey}/${relativePath}`;
-}
-
-function syncKeyToGistFileName(syncKey: string): string {
-  return syncKey.replace(/\//g, "--");
-}
-
-function gistFileNameToSyncKey(gistFileName: string): string {
-  return gistFileName.replace(/--/g, "/");
-}
-
-function computeMachineId(): string {
-  const raw = `${os.hostname()}:${os.userInfo().username}`;
-  return crypto.createHash("sha256").update(raw).digest("hex");
 }
 
 export async function executeExportTranscripts(
@@ -226,63 +256,27 @@ export async function executeExportTranscripts(
   );
 
   const confirm = await vscode.window.showWarningMessage(
-    `This will create a PUBLIC Gist with ${selectedFiles.length} transcript file(s). ` +
+    `This will create a private Gist with ${selectedFiles.length} transcript file(s). ` +
+      "It is not listed on your public profile, but anyone with the direct URL can still open it. " +
       "Transcripts may contain sensitive data (prompts, code, secrets). Continue?",
     { modal: true },
     "Export"
   );
   if (confirm !== "Export") return;
 
-  const gistFiles: Record<string, { content: string }> = {};
-  const manifestFiles: Record<string, TranscriptManifestFileEntry> = {};
-  const sourceProjects: Record<string, TranscriptProjectInfo> = {};
-
-  for (const proj of selectedProjects) {
-    const count = selectedFiles.filter((f) => f.projectKey === proj.folderName).length;
-    if (count > 0) {
-      sourceProjects[proj.folderName] = { folderName: proj.folderName, fileCount: count };
-    }
-  }
-
-  for (const file of selectedFiles) {
-    const buf = await fs.readFile(file.absolutePath);
-    const content = buf.toString("utf-8");
-    const checksum = crypto.createHash("sha256").update(buf).digest("hex");
-    const syncKey = transcriptSyncKey(file.projectKey, file.relativePath);
-    const gistFileName = syncKeyToGistFileName(syncKey);
-    gistFiles[gistFileName] = { content };
-    manifestFiles[syncKey] = {
-      projectKey: file.projectKey,
-      checksum,
-      sizeBytes: buf.length,
-    };
-  }
-
-  const manifest: TranscriptManifest = {
-    schemaVersion: 1,
-    type: "agent-transcripts",
-    createdAt: new Date().toISOString(),
-    sourceMachineId: computeMachineId(),
-    sourceOS: process.platform,
-    sourceProjects,
-    files: manifestFiles,
-  };
-
-  gistFiles["transcript-manifest.json"] = {
-    content: JSON.stringify(manifest, null, 2),
-  };
+  const { gistFiles } = await buildExportBundleV2(selectedFiles, selectedProjects);
 
   const client = new GistClient(token);
 
   vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Creating public Gist with transcripts...",
+      title: "Creating private Gist with transcripts...",
       cancellable: false,
     },
     async () => {
       const result = await withRetry(() =>
-        client.createGist(gistFiles, "Cursor Sync - Agent Transcripts Export", true)
+        client.createGist(gistFiles, "Cursor Sync - Agent Transcripts Export")
       );
 
       if (!result.ok) {
@@ -297,7 +291,7 @@ export async function executeExportTranscripts(
       logger.appendLine(`[${new Date().toISOString()}] Transcript export succeeded: ${gistUrl}`);
 
       const action = await vscode.window.showInformationMessage(
-        `Transcript export successful! Gist: ${gistUrl}`,
+        `Transcript export successful! Private Gist: ${gistUrl}. Anyone with the link can open it.`,
         "Copy URL"
       );
       if (action === "Copy URL") {
@@ -347,7 +341,7 @@ export async function executeImportTranscripts(
   }
 
   const gistData: GistResponse = gistResult.data;
-  const manifestFile = gistData.files["transcript-manifest.json"];
+  const manifestFile = gistData.files[TRANSCRIPT_MANIFEST_FILE_NAME];
   if (!manifestFile) {
     vscode.window.showErrorMessage(
       "Import failed: transcript-manifest.json not found. This Gist may not contain exported transcripts."
@@ -355,22 +349,13 @@ export async function executeImportTranscripts(
     return;
   }
 
-  let manifest: TranscriptManifest;
+  let manifest: TranscriptManifestV1 | TranscriptManifestV2;
   try {
-    manifest = JSON.parse(manifestFile.content) as TranscriptManifest;
-  } catch {
-    vscode.window.showErrorMessage("Import failed: invalid transcript-manifest.json.");
-    return;
-  }
-
-  if (manifest.type !== "agent-transcripts") {
-    vscode.window.showErrorMessage("Import failed: Gist does not contain agent transcripts.");
-    return;
-  }
-
-  const sourceProjectKeys = Object.keys(manifest.sourceProjects);
-  if (sourceProjectKeys.length === 0) {
-    vscode.window.showInformationMessage("No source projects found in the transcript export.");
+    manifest = parseTranscriptBundleManifest(manifestFile.content);
+  } catch (error) {
+    vscode.window.showErrorMessage(
+      `Import failed: ${error instanceof Error ? error.message : "invalid transcript-manifest.json."}`
+    );
     return;
   }
 
@@ -383,36 +368,20 @@ export async function executeImportTranscripts(
     return;
   }
 
-  const projectMapping: Map<string, ProjectInfo> = new Map();
+  const projectMapping = await promptForProjectMapping(
+    Object.keys(manifest.sourceProjects),
+    Object.fromEntries(
+      Object.entries(manifest.sourceProjects).map(([projectKey, info]) => [
+        projectKey,
+        { fileCount: info.fileCount },
+      ])
+    ),
+    localProjects,
+    logger
+  );
 
-  for (const srcKey of sourceProjectKeys) {
-    const srcInfo = manifest.sourceProjects[srcKey];
-    const srcLabel = humanLabel(srcKey);
-
-    const picks: vscode.QuickPickItem[] = localProjects.map((p) => ({
-      label: p.label,
-      description: p.folderName,
-      detail: p.fullPath,
-    }));
-
-    picks.unshift({ label: "(Skip this project)", description: "skip" });
-
-    const selected = await vscode.window.showQuickPick(picks, {
-      title: `Map source project "${srcLabel}" (${srcInfo.fileCount} file(s)) to a local project`,
-      placeHolder: `Select the local project to receive transcripts from "${srcLabel}"`,
-    });
-
-    if (!selected) {
-      logger.appendLine(`[${new Date().toISOString()}] Transcript import cancelled during project mapping`);
-      return;
-    }
-
-    if (selected.description === "skip") continue;
-
-    const target = localProjects.find((p) => p.folderName === selected.description);
-    if (target) {
-      projectMapping.set(srcKey, target);
-    }
+  if (projectMapping === null) {
+    return;
   }
 
   if (projectMapping.size === 0) {
@@ -420,53 +389,311 @@ export async function executeImportTranscripts(
     return;
   }
 
-  const filesToWrite: Array<{
-    absolutePath: string;
-    syncKey: string;
-    content: Buffer;
-  }> = [];
+  if (isTranscriptManifestV2(manifest)) {
+    await importTranscriptBundleV2(context, gistData, manifest, projectMapping, logger);
+    return;
+  }
 
-  for (const [gistFileName, gistFile] of Object.entries(gistData.files)) {
-    if (gistFileName === "transcript-manifest.json") continue;
+  await importTranscriptBundleV1(context, gistData, manifest, projectMapping, logger);
+}
 
-    const syncKey = gistFileNameToSyncKey(gistFileName);
-    const manifestEntry = manifest.files[syncKey];
-    if (!manifestEntry) continue;
+function extractGistId(input: string): string | null {
+  const match = input.match(
+    /(?:gist\.github\.com\/[^/]+\/|)([a-f0-9]{32}|[a-f0-9]{20})/i
+  );
+  return match ? match[1] : null;
+}
 
-    const srcProjectKey = manifestEntry.projectKey;
-    const targetProject = projectMapping.get(srcProjectKey);
-    if (!targetProject) continue;
+async function buildExportBundleV2(
+  selectedFiles: TranscriptFileEntry[],
+  selectedProjects: ProjectInfo[]
+): Promise<{ gistFiles: Record<string, { content: string }>; manifest: TranscriptManifestV2 }> {
+  const createdAt = new Date().toISOString();
+  const artifactContents = new Map<string, { content: string }>();
+  const artifactEntries = new Map<string, TranscriptBundleArtifactEntry>();
+  const conversationStates = new Map<string, ExportConversationState>();
+  const projectAccumulators = new Map<string, ExportProjectAccumulator>();
+  const globalWarnings = new Set<string>();
+  const sortedFiles = [...selectedFiles].sort((a, b) => {
+    const projectCompare = a.projectKey.localeCompare(b.projectKey);
+    return projectCompare !== 0 ? projectCompare : a.relativePath.localeCompare(b.relativePath);
+  });
 
-    const relativeInProject = syncKey.slice(
-      `transcripts/${srcProjectKey}/`.length
-    );
-    const targetPath = path.join(
-      targetProject.fullPath,
-      "agent-transcripts",
-      ...relativeInProject.split("/")
-    );
-
-    filesToWrite.push({
-      absolutePath: targetPath,
-      syncKey,
-      content: Buffer.from(gistFile.content, "utf-8"),
+  for (const project of selectedProjects) {
+    projectAccumulators.set(project.folderName, {
+      folderName: project.folderName,
+      fileCount: 0,
+      conversationIds: new Set<string>(),
+      artifactCount: 0,
     });
   }
 
-  if (filesToWrite.length === 0) {
+  for (const file of sortedFiles) {
+    const fileBuffer = await fs.readFile(file.absolutePath);
+    const fileContent = fileBuffer.toString("utf-8");
+    const conversationId = getConversationIdFromRelativePath(file.relativePath);
+    const conversationKey = `${file.projectKey}:${conversationId}`;
+    const projectAccumulator = projectAccumulators.get(file.projectKey) ?? {
+      folderName: file.projectKey,
+      fileCount: 0,
+      conversationIds: new Set<string>(),
+      artifactCount: 0,
+    };
+
+    projectAccumulator.fileCount += 1;
+    projectAccumulator.conversationIds.add(conversationId);
+    projectAccumulators.set(file.projectKey, projectAccumulator);
+
+    const stat = await fs.stat(file.absolutePath);
+    const fileUpdatedAt = stat.mtime.toISOString();
+    const conversationState = conversationStates.get(conversationKey) ?? {
+      projectKey: file.projectKey,
+      conversationId,
+      transcriptArtifacts: [],
+      transcriptRelativePaths: [],
+      primaryTranscriptContent: fileContent,
+      primaryTranscriptSelectedAt: "",
+      lastUpdatedAt: fileUpdatedAt,
+      warnings: [],
+    };
+
+    if (
+      conversationState.primaryTranscriptSelectedAt.length === 0 ||
+      path.basename(file.relativePath) === `${conversationId}.jsonl`
+    ) {
+      conversationState.primaryTranscriptContent = fileContent;
+      conversationState.primaryTranscriptSelectedAt = file.relativePath;
+    }
+
+    if (fileUpdatedAt > conversationState.lastUpdatedAt) {
+      conversationState.lastUpdatedAt = fileUpdatedAt;
+    }
+
+    conversationState.transcriptRelativePaths.push(file.relativePath);
+
+    const scopedRelativePath =
+      getConversationScopedRelativePath(file.relativePath) || path.basename(file.relativePath);
+    const artifactKey = bundleArtifactSyncKey(
+      file.projectKey,
+      conversationId,
+      "transcript",
+      scopedRelativePath
+    );
+
+    artifactContents.set(artifactKey, {
+      content: fileContent,
+    });
+    artifactEntries.set(artifactKey, {
+      projectKey: file.projectKey,
+      conversationId,
+      kind: "transcript",
+      checksum: computeArtifactChecksum(fileBuffer),
+      sizeBytes: fileBuffer.length,
+      contentType: "application/x-jsonlines",
+      sourceRelativePath: file.relativePath,
+    });
+    conversationState.transcriptArtifacts.push(artifactKey);
+    conversationStates.set(conversationKey, conversationState);
+  }
+
+  const conversationRecords = new Map<string, TranscriptBundleConversationEntry>();
+  const sortedConversationKeys = [...conversationStates.keys()].sort();
+
+  for (const conversationKey of sortedConversationKeys) {
+    const conversationState = conversationStates.get(conversationKey);
+    if (!conversationState) {
+      continue;
+    }
+
+    const projectAccumulator = projectAccumulators.get(conversationState.projectKey);
+    const storeSnapshot = await findStoreDbForConversation(conversationState.conversationId);
+    if (storeSnapshot) {
+      const storeBuffer = await fs.readFile(storeSnapshot.absolutePath);
+      const encoded = encodeTranscriptArtifact(storeBuffer, true);
+      const storeArtifactKey = bundleArtifactSyncKey(
+        conversationState.projectKey,
+        conversationState.conversationId,
+        "store",
+        "store.db"
+      );
+
+      artifactContents.set(storeArtifactKey, { content: encoded.content });
+      artifactEntries.set(storeArtifactKey, {
+        projectKey: conversationState.projectKey,
+        conversationId: conversationState.conversationId,
+        kind: "store",
+        checksum: computeArtifactChecksum(storeBuffer),
+        sizeBytes: storeBuffer.length,
+        contentType: "application/octet-stream",
+        encoding: encoded.encoding,
+        sourceWorkspaceKey: storeSnapshot.workspaceKey,
+      });
+      conversationState.storeArtifact = storeArtifactKey;
+      conversationState.sourceWorkspaceKey = storeSnapshot.workspaceKey;
+      if (projectAccumulator) {
+        projectAccumulator.artifactCount += 1;
+      }
+    } else {
+      conversationState.warnings.push(
+        "Store snapshot was not found under ~/.cursor/chats; transcript JSONL will still be exported."
+      );
+    }
+
+    const sidebarSnapshot = await buildSidebarMetadataSnapshot(conversationState, createdAt);
+    const sidebarBuffer = Buffer.from(JSON.stringify(sidebarSnapshot, null, 2), "utf-8");
+    const sidebarArtifactKey = bundleArtifactSyncKey(
+      conversationState.projectKey,
+      conversationState.conversationId,
+      "sidebar",
+      "sidebar-metadata.json"
+    );
+
+    artifactContents.set(sidebarArtifactKey, {
+      content: sidebarBuffer.toString("utf-8"),
+    });
+    artifactEntries.set(sidebarArtifactKey, {
+      projectKey: conversationState.projectKey,
+      conversationId: conversationState.conversationId,
+      kind: "sidebar",
+      checksum: computeArtifactChecksum(sidebarBuffer),
+      sizeBytes: sidebarBuffer.length,
+      contentType: "application/json",
+    });
+
+    const summary = summarizeTranscriptForSidebar(
+      conversationState.primaryTranscriptContent,
+      conversationState.conversationId
+    );
+    const lastUpdatedAt =
+      summary.lastUpdatedAt ?? conversationState.lastUpdatedAt ?? createdAt;
+
+    conversationRecords.set(conversationKey, {
+      projectKey: conversationState.projectKey,
+      conversationId: conversationState.conversationId,
+      title: summary.title,
+      subtitle: summary.subtitle,
+      previewText: summary.previewText,
+      lastUpdatedAt,
+      transcriptArtifacts: [...conversationState.transcriptArtifacts].sort(),
+      storeArtifact: conversationState.storeArtifact,
+      sidebarArtifact: sidebarArtifactKey,
+      warnings: [...conversationState.warnings].sort(),
+    });
+
+    if (projectAccumulator) {
+      projectAccumulator.artifactCount += conversationState.transcriptArtifacts.length + 1;
+    }
+
+    for (const warning of conversationState.warnings) {
+      globalWarnings.add(
+        `${conversationState.projectKey}/${conversationState.conversationId}: ${warning}`
+      );
+    }
+  }
+
+  const sourceProjects = toSortedRecord(
+    [...projectAccumulators.entries()].map(([projectKey, accumulator]) => [
+      projectKey,
+      {
+        folderName: accumulator.folderName,
+        fileCount: accumulator.fileCount,
+        conversationCount: accumulator.conversationIds.size,
+        artifactCount: accumulator.artifactCount,
+      } satisfies TranscriptBundleSourceProjectInfo,
+    ])
+  );
+
+  const artifacts = toSortedRecord([...artifactEntries.entries()]);
+  const conversations = toSortedRecord([...conversationRecords.entries()]);
+  const manifest: TranscriptManifestV2 = {
+    schemaVersion: 2,
+    type: "agent-transcripts",
+    createdAt,
+    sourceMachineId: computeTranscriptMachineId(),
+    sourceOS: process.platform,
+    sourceProjects,
+    artifacts,
+    conversations,
+    warnings: [...globalWarnings].sort(),
+  };
+
+  const gistFiles: Record<string, { content: string }> = {};
+  for (const [artifactKey, file] of [...artifactContents.entries()].sort(([a], [b]) =>
+    a.localeCompare(b)
+  )) {
+    gistFiles[syncKeyToGistFileName(artifactKey)] = file;
+  }
+
+  gistFiles[TRANSCRIPT_MANIFEST_FILE_NAME] = {
+    content: JSON.stringify(manifest, null, 2),
+  };
+
+  return { gistFiles, manifest };
+}
+
+async function importTranscriptBundleV1(
+  context: vscode.ExtensionContext,
+  gistData: GistResponse,
+  manifest: TranscriptManifestV1,
+  projectMapping: Map<string, ProjectInfo>,
+  logger: ReturnType<typeof getLogger>
+): Promise<void> {
+  const operations: RestoreOperation[] = [];
+
+  for (const [gistFileName, gistFile] of Object.entries(gistData.files)) {
+    if (gistFileName === TRANSCRIPT_MANIFEST_FILE_NAME) {
+      continue;
+    }
+
+    const syncKey = gistFileNameToSyncKey(gistFileName);
+    const manifestEntry = manifest.files[syncKey];
+    if (!manifestEntry) {
+      continue;
+    }
+
+    const targetProject = projectMapping.get(manifestEntry.projectKey);
+    if (!targetProject) {
+      continue;
+    }
+
+    const relativeInProject = syncKey.slice(`transcripts/${manifestEntry.projectKey}/`.length);
+    const content = Buffer.from(gistFile.content, "utf-8");
+    const checksum = computeArtifactChecksum(content);
+    if (checksum !== manifestEntry.checksum) {
+      vscode.window.showErrorMessage(
+        `Import failed: checksum mismatch for ${relativeInProject}.`
+      );
+      return;
+    }
+
+    operations.push({
+      absolutePath: path.join(
+        targetProject.fullPath,
+        "agent-transcripts",
+        ...relativeInProject.split("/")
+      ),
+      content,
+      checksum,
+      syncKey,
+      kind: "transcript",
+      conversationId: getConversationIdFromRelativePath(relativeInProject),
+    });
+  }
+
+  if (operations.length === 0) {
     vscode.window.showInformationMessage("No transcript files to write after mapping.");
     return;
   }
 
-  const fileItems: vscode.QuickPickItem[] = filesToWrite.map((f) => ({
-    label: path.basename(f.absolutePath),
-    description: f.absolutePath,
+  const fileItems: vscode.QuickPickItem[] = operations.map((operation) => ({
+    label: path.basename(operation.absolutePath),
+    description: operation.absolutePath,
     picked: true,
   }));
 
   const selectedItems = await vscode.window.showQuickPick(fileItems, {
     canPickMany: true,
-    title: `Select transcript files to import (${filesToWrite.length} total)`,
+    title: `Select transcript files to import (${operations.length} total)`,
     placeHolder: "Deselect files you do not want to import",
   });
 
@@ -475,57 +702,613 @@ export async function executeImportTranscripts(
     return;
   }
 
-  const selectedPaths = new Set(selectedItems.map((s) => s.description));
-  const finalFiles = filesToWrite.filter((f) => selectedPaths.has(f.absolutePath));
+  const selectedPaths = new Set(selectedItems.map((item) => item.description));
+  const selectedOperations = operations.filter((operation) =>
+    selectedPaths.has(operation.absolutePath)
+  );
 
-  let writeError = false;
-
-  await vscode.window.withProgress(
+  await previewAndApplyImportPlan(
+    context,
+    selectedOperations,
+    "Import transcript files",
+    logger,
     {
-      location: vscode.ProgressLocation.Notification,
-      title: `Writing ${finalFiles.length} transcript file(s)...`,
-      cancellable: false,
-    },
-    async () => {
-      for (const file of finalFiles) {
-        try {
-          const dir = path.dirname(file.absolutePath);
-          await fs.mkdir(dir, { recursive: true });
-          const tmpPath = file.absolutePath + ".tmp";
-          await fs.writeFile(tmpPath, file.content);
-          await fs.rename(tmpPath, file.absolutePath);
-        } catch (err) {
-          logger.appendLine(
-            `[${new Date().toISOString()}] Transcript write failed for ${file.absolutePath}: ${err instanceof Error ? err.message : String(err)}`
-          );
-          writeError = true;
-          break;
-        }
-      }
+      sidebarRestoreStagedOnly: false,
     }
-  );
-
-  if (writeError) {
-    vscode.window.showErrorMessage("Transcript import failed: file write error.");
-    return;
-  }
-
-  const projectSummary = [...projectMapping.entries()]
-    .map(([src, target]) => `${humanLabel(src)} -> ${target.label}`)
-    .join(", ");
-
-  vscode.window.showInformationMessage(
-    `Transcript import complete: ${finalFiles.length} file(s) written. Mappings: ${projectSummary}. ` +
-      "Note: Verify that Cursor loads the imported threads by opening the project."
-  );
-  logger.appendLine(
-    `[${new Date().toISOString()}] Transcript import succeeded: ${finalFiles.length} files`
   );
 }
 
-function extractGistId(input: string): string | null {
-  const match = input.match(
-    /(?:gist\.github\.com\/[^/]+\/|)([a-f0-9]{32}|[a-f0-9]{20})/i
+async function importTranscriptBundleV2(
+  context: vscode.ExtensionContext,
+  gistData: GistResponse,
+  manifest: TranscriptManifestV2,
+  projectMapping: Map<string, ProjectInfo>,
+  logger: ReturnType<typeof getLogger>
+): Promise<void> {
+  const availableConversations = Object.entries(manifest.conversations)
+    .filter(([, conversation]) => projectMapping.has(conversation.projectKey))
+    .sort(([a], [b]) => a.localeCompare(b));
+
+  if (availableConversations.length === 0) {
+    vscode.window.showInformationMessage("No conversations remain after project mapping.");
+    return;
+  }
+
+  const conversationItems: Array<vscode.QuickPickItem & { conversationKey: string }> =
+    availableConversations.map(([conversationKey, conversation]) => ({
+      conversationKey,
+      label: conversation.title,
+      description: `${humanLabel(conversation.projectKey)} · ${conversation.conversationId}`,
+      detail: [
+        conversation.subtitle,
+        conversation.storeArtifact ? "store snapshot included" : "store snapshot missing",
+        "sidebar metadata staged only",
+      ].join(" · "),
+      picked: true,
+    }));
+
+  const selectedConversations = await vscode.window.showQuickPick(conversationItems, {
+    canPickMany: true,
+    title: `Select conversations to import (${conversationItems.length} available)`,
+    placeHolder: "Deselect conversations you do not want to restore",
+  });
+
+  if (!selectedConversations || selectedConversations.length === 0) {
+    logger.appendLine(
+      `[${new Date().toISOString()}] Transcript import cancelled: no conversations selected`
+    );
+    return;
+  }
+
+  const selectedConversationKeys = new Set(
+    selectedConversations.map((conversation) => conversation.conversationKey)
   );
-  return match ? match[1] : null;
+  const operations: RestoreOperation[] = [];
+  const validationErrors: string[] = [];
+  const stagedWarnings = new Set<string>();
+
+  for (const [conversationKey, conversation] of availableConversations) {
+    if (!selectedConversationKeys.has(conversationKey)) {
+      continue;
+    }
+
+    const targetProject = projectMapping.get(conversation.projectKey);
+    if (!targetProject) {
+      continue;
+    }
+
+    const artifactIds = [
+      ...conversation.transcriptArtifacts,
+      conversation.sidebarArtifact,
+      ...(conversation.storeArtifact ? [conversation.storeArtifact] : []),
+    ];
+
+    for (const artifactId of artifactIds) {
+      const artifactEntry = manifest.artifacts[artifactId];
+      if (!artifactEntry) {
+        validationErrors.push(`Manifest is missing artifact metadata for ${artifactId}.`);
+        continue;
+      }
+
+      const gistFile = gistData.files[syncKeyToGistFileName(artifactId)];
+      if (!gistFile) {
+        validationErrors.push(`Bundle is missing ${artifactId}.`);
+        continue;
+      }
+
+      const content = decodeTranscriptArtifact(gistFile.content, artifactEntry.encoding);
+      const checksum = computeArtifactChecksum(content);
+      if (checksum !== artifactEntry.checksum) {
+        validationErrors.push(`Checksum mismatch for ${artifactId}.`);
+        continue;
+      }
+
+      operations.push({
+        absolutePath: resolveArtifactImportPath(targetProject, artifactEntry),
+        content,
+        checksum,
+        syncKey: artifactId,
+        kind: artifactEntry.kind,
+        conversationId: artifactEntry.conversationId,
+      });
+
+      if (artifactEntry.kind === "sidebar") {
+        stagedWarnings.add(
+          `${artifactEntry.conversationId}: sidebar metadata will be restored as JSON only; state.vscdb will not be modified.`
+        );
+      }
+    }
+
+    for (const warning of conversation.warnings) {
+      stagedWarnings.add(`${conversation.conversationId}: ${warning}`);
+    }
+  }
+
+  if (validationErrors.length > 0) {
+    vscode.window.showErrorMessage(
+      `Import failed: ${validationErrors.slice(0, 3).join(" ")}`
+    );
+    return;
+  }
+
+  if (operations.length === 0) {
+    vscode.window.showInformationMessage("No bundle artifacts to restore after selection.");
+    return;
+  }
+
+  await previewAndApplyImportPlan(
+    context,
+    operations,
+    "Import conversation bundle",
+    logger,
+    {
+      sidebarRestoreStagedOnly: true,
+      warnings: [...stagedWarnings].sort(),
+    }
+  );
+}
+
+async function promptForProjectMapping(
+  sourceProjectKeys: string[],
+  sourceProjects: Record<string, { fileCount: number }>,
+  localProjects: ProjectInfo[],
+  logger: ReturnType<typeof getLogger>
+): Promise<Map<string, ProjectInfo> | null> {
+  if (sourceProjectKeys.length === 0) {
+    vscode.window.showInformationMessage("No source projects found in the transcript export.");
+    return new Map();
+  }
+
+  const projectMapping: Map<string, ProjectInfo> = new Map();
+
+  for (const sourceProjectKey of sourceProjectKeys.sort()) {
+    const sourceInfo = sourceProjects[sourceProjectKey];
+    const sourceLabel = humanLabel(sourceProjectKey);
+    const picks: vscode.QuickPickItem[] = localProjects.map((project) => ({
+      label: project.label,
+      description: project.folderName,
+      detail: project.fullPath,
+    }));
+
+    picks.unshift({ label: "(Skip this project)", description: "skip" });
+
+    const selected = await vscode.window.showQuickPick(picks, {
+      title: `Map source project "${sourceLabel}" (${sourceInfo.fileCount} file(s)) to a local project`,
+      placeHolder: `Select the local project to receive transcripts from "${sourceLabel}"`,
+    });
+
+    if (!selected) {
+      logger.appendLine(`[${new Date().toISOString()}] Transcript import cancelled during project mapping`);
+      return null;
+    }
+
+    if (selected.description === "skip") {
+      continue;
+    }
+
+    const targetProject = localProjects.find(
+      (project) => project.folderName === selected.description
+    );
+    if (targetProject) {
+      projectMapping.set(sourceProjectKey, targetProject);
+    }
+  }
+
+  return projectMapping;
+}
+
+async function previewAndApplyImportPlan(
+  context: vscode.ExtensionContext,
+  operations: RestoreOperation[],
+  actionLabel: string,
+  logger: ReturnType<typeof getLogger>,
+  options: {
+    sidebarRestoreStagedOnly: boolean;
+    warnings?: string[];
+  }
+): Promise<void> {
+  const preview = await previewRestoreOperations(operations);
+
+  if (preview.newFiles.length === 0 && preview.conflicts.length === 0) {
+    vscode.window.showInformationMessage(
+      `${actionLabel} skipped: all selected artifacts are already up to date.`
+    );
+    return;
+  }
+
+  const summary = [
+    `${operations.length} artifact(s) selected`,
+    `${preview.newFiles.length} new`,
+    `${preview.conflicts.length} conflict${preview.conflicts.length === 1 ? "" : "s"}`,
+    `${preview.unchanged.length} unchanged`,
+  ].join(", ");
+
+  let conflictPolicy: "overwrite" | "skip" = "overwrite";
+  if (preview.conflicts.length > 0) {
+    const choice = await vscode.window.showWarningMessage(
+      `${actionLabel}: ${summary}. Choose how to handle conflicts.`,
+      { modal: true },
+      "Overwrite Conflicts",
+      "Skip Conflicts",
+      "Cancel"
+    );
+
+    if (choice === "Cancel" || !choice) {
+      logger.appendLine(`[${new Date().toISOString()}] Transcript import cancelled during conflict review`);
+      return;
+    }
+
+    conflictPolicy = choice === "Skip Conflicts" ? "skip" : "overwrite";
+  } else {
+    const choice = await vscode.window.showWarningMessage(
+      `${actionLabel}: ${summary}. Continue?`,
+      { modal: true },
+      "Import",
+      "Cancel"
+    );
+
+    if (choice !== "Import") {
+      logger.appendLine(`[${new Date().toISOString()}] Transcript import cancelled during preview confirmation`);
+      return;
+    }
+  }
+
+  const toWrite = [
+    ...preview.newFiles,
+    ...(conflictPolicy === "overwrite" ? preview.conflicts : []),
+  ].sort((a, b) => a.absolutePath.localeCompare(b.absolutePath));
+
+  if (toWrite.length === 0) {
+    vscode.window.showInformationMessage(
+      `${actionLabel} skipped: conflicts were left untouched and the rest was already up to date.`
+    );
+    return;
+  }
+
+  const result = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Writing ${toWrite.length} transcript artifact(s)...`,
+      cancellable: false,
+    },
+    async () => applyRestoreOperations(context, toWrite, logger)
+  );
+
+  if (!result.ok) {
+    vscode.window.showErrorMessage(result.message);
+    return;
+  }
+
+  const warningSuffix =
+    options.warnings && options.warnings.length > 0
+      ? ` Warnings: ${options.warnings.slice(0, 3).join(" ")}`
+      : "";
+  const sidebarSuffix = options.sidebarRestoreStagedOnly
+    ? " Sidebar metadata was restored as JSON sidecars only."
+    : "";
+
+  vscode.window.showInformationMessage(
+    `Transcript import complete: ${result.writtenCount} artifact(s) written, ${preview.unchanged.length} unchanged, ` +
+      `${conflictPolicy === "skip" ? preview.conflicts.length : 0} conflict(s) skipped.${sidebarSuffix}${warningSuffix}`
+  );
+  logger.appendLine(
+    `[${new Date().toISOString()}] Transcript import succeeded: ${result.writtenCount} artifacts`
+  );
+}
+
+async function previewRestoreOperations(
+  operations: RestoreOperation[]
+): Promise<RestorePreview> {
+  const preview: RestorePreview = {
+    newFiles: [],
+    conflicts: [],
+    unchanged: [],
+  };
+
+  for (const operation of operations) {
+    try {
+      const existing = await fs.readFile(operation.absolutePath);
+      const existingChecksum = computeArtifactChecksum(existing);
+      if (existingChecksum === operation.checksum) {
+        preview.unchanged.push(operation);
+      } else {
+        preview.conflicts.push(operation);
+      }
+    } catch {
+      preview.newFiles.push(operation);
+    }
+  }
+
+  return preview;
+}
+
+async function applyRestoreOperations(
+  context: vscode.ExtensionContext,
+  operations: RestoreOperation[],
+  logger: ReturnType<typeof getLogger>
+): Promise<
+  | { ok: true; writtenCount: number }
+  | { ok: false; message: string }
+> {
+  const existingPaths: string[] = [];
+  const createdPaths: string[] = [];
+
+  for (const operation of operations) {
+    try {
+      await fs.access(operation.absolutePath);
+      existingPaths.push(operation.absolutePath);
+    } catch {
+      createdPaths.push(operation.absolutePath);
+    }
+  }
+
+  const { entries: backupEntries } = await createBackup(context, existingPaths);
+  let writtenCount = 0;
+
+  for (const operation of operations) {
+    try {
+      await fs.mkdir(path.dirname(operation.absolutePath), { recursive: true });
+      const tmpPath = `${operation.absolutePath}.tmp`;
+      await fs.writeFile(tmpPath, operation.content);
+      await fs.rename(tmpPath, operation.absolutePath);
+      writtenCount += 1;
+    } catch (error) {
+      logger.appendLine(
+        `[${new Date().toISOString()}] Transcript write failed for ${operation.absolutePath}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      await rollbackFromBackup(backupEntries);
+      await Promise.all(
+        createdPaths.map((createdPath) => fs.rm(createdPath, { force: true }).catch(() => undefined))
+      );
+      return {
+        ok: false,
+        message: "Transcript import failed: file write error. Existing files were rolled back.",
+      };
+    }
+  }
+
+  await pruneOldBackups(context);
+  return { ok: true, writtenCount };
+}
+
+async function buildSidebarMetadataSnapshot(
+  conversationState: ExportConversationState,
+  exportedAt: string
+): Promise<Record<string, unknown>> {
+  const summary = summarizeTranscriptForSidebar(
+    conversationState.primaryTranscriptContent,
+    conversationState.conversationId
+  );
+  const evidence = await extractSidebarStateEvidence(conversationState.conversationId);
+
+  return {
+    schemaVersion: 1,
+    snapshotType: "cursor-sidebar-metadata",
+    exportedAt,
+    projectKey: conversationState.projectKey,
+    conversationId: conversationState.conversationId,
+    title: summary.title,
+    subtitle: summary.subtitle,
+    previewText: summary.previewText,
+    messageCount: summary.messageCount,
+    participants: summary.participants,
+    lastUpdatedAt: summary.lastUpdatedAt ?? conversationState.lastUpdatedAt ?? exportedAt,
+    transcriptRelativePaths: [...conversationState.transcriptRelativePaths].sort(),
+    storeSnapshotIncluded: Boolean(conversationState.storeArtifact),
+    sourceWorkspaceKey: conversationState.sourceWorkspaceKey ?? null,
+    extraction: evidence?.extraction ?? "derived-only",
+    stateDbPath: evidence?.stateDbPath ?? null,
+    matchedItemTableRows: evidence?.matchedItemTableRows ?? [],
+    matchedCursorDiskRows: evidence?.matchedCursorDiskRows ?? [],
+    composerSummaryRows: evidence?.composerSummaryRows ?? [],
+    warnings: [...conversationState.warnings].sort(),
+  };
+}
+
+async function extractSidebarStateEvidence(
+  conversationId: string
+): Promise<SidebarStateEvidence | undefined> {
+  const stateDbCandidates = await resolveStateDbCandidates();
+  const escapedConversationId = conversationId.replace(/'/g, "''");
+
+  for (const stateDbPath of stateDbCandidates) {
+    const matchedItemTableRows = await querySqliteRows(
+      stateDbPath,
+      `SELECT key, value FROM ItemTable WHERE value LIKE '%${escapedConversationId}%' LIMIT 10;`
+    );
+    const matchedCursorDiskRows = await querySqliteRows(
+      stateDbPath,
+      `SELECT key, value FROM cursorDiskKV WHERE key LIKE '%${escapedConversationId}%' OR value LIKE '%${escapedConversationId}%' LIMIT 10;`
+    );
+    const composerSummaryRows = await querySqliteRows(
+      stateDbPath,
+      "SELECT key, length(value) AS valueLength FROM ItemTable WHERE key IN ('composer.composerHeaders', 'composer.composerData') LIMIT 5;"
+    );
+
+    if (
+      matchedItemTableRows.length > 0 ||
+      matchedCursorDiskRows.length > 0 ||
+      composerSummaryRows.length > 0
+    ) {
+      return {
+        stateDbPath,
+        extraction:
+          matchedItemTableRows.length > 0 || matchedCursorDiskRows.length > 0
+            ? "state-db-match"
+            : "state-db-unmatched",
+        matchedItemTableRows: matchedItemTableRows.map((row) => ({
+          key: String(row.key ?? ""),
+          value: coerceSqliteValue(row.value),
+        })),
+        matchedCursorDiskRows: matchedCursorDiskRows.map((row) => ({
+          key: String(row.key ?? ""),
+          value: coerceSqliteValue(row.value),
+        })),
+        composerSummaryRows: composerSummaryRows.map((row) => ({
+          key: String(row.key ?? ""),
+          valueLength: Number(row.valueLength ?? 0),
+        })),
+      };
+    }
+  }
+
+  return undefined;
+}
+
+async function querySqliteRows(
+  dbPath: string,
+  sql: string
+): Promise<Array<Record<string, unknown>>> {
+  try {
+    const { stdout } = await execFile("sqlite3", ["-json", dbPath, sql]);
+    const trimmed = stdout.trim();
+    if (!trimmed) {
+      return [];
+    }
+
+    const parsed = JSON.parse(trimmed) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function coerceSqliteValue(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      const serialized = JSON.stringify(parsed);
+      if (serialized.length > 4000) {
+        return `${serialized.slice(0, 4000)}…`;
+      }
+      return parsed;
+    } catch {
+      return trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}…` : trimmed;
+    }
+  }
+
+  return trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}…` : trimmed;
+}
+
+async function resolveStateDbCandidates(): Promise<string[]> {
+  const candidates = new Set<string>();
+  const home = os.homedir();
+
+  const platformCandidates =
+    process.platform === "darwin"
+      ? [
+          path.join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb"),
+          path.join(
+            home,
+            "Library",
+            "Application Support",
+            "Cursor Nightly",
+            "User",
+            "globalStorage",
+            "state.vscdb"
+          ),
+        ]
+      : process.platform === "win32"
+        ? [
+            path.join(home, "AppData", "Roaming", "Cursor", "User", "globalStorage", "state.vscdb"),
+            path.join(
+              home,
+              "AppData",
+              "Roaming",
+              "Cursor Nightly",
+              "User",
+              "globalStorage",
+              "state.vscdb"
+            ),
+          ]
+        : [
+            path.join(home, ".config", "Cursor", "User", "globalStorage", "state.vscdb"),
+            path.join(home, ".config", "Cursor Nightly", "User", "globalStorage", "state.vscdb"),
+          ];
+
+  for (const candidate of platformCandidates) {
+    try {
+      await fs.access(candidate);
+      candidates.add(candidate);
+    } catch {}
+  }
+
+  return [...candidates].sort();
+}
+
+function resolveChatsRoot(): string {
+  return path.join(os.homedir(), ".cursor", "chats");
+}
+
+async function findStoreDbForConversation(
+  conversationId: string
+): Promise<{ absolutePath: string; workspaceKey: string } | undefined> {
+  let workspaceEntries: import("node:fs").Dirent[];
+  try {
+    workspaceEntries = await fs.readdir(resolveChatsRoot(), { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+
+  const sortedWorkspaceEntries = workspaceEntries
+    .filter((entry) => entry.isDirectory())
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  for (const workspaceEntry of sortedWorkspaceEntries) {
+    const candidate = path.join(resolveChatsRoot(), workspaceEntry.name, conversationId, "store.db");
+    try {
+      const stat = await fs.stat(candidate);
+      if (stat.isFile()) {
+        return {
+          absolutePath: candidate,
+          workspaceKey: workspaceEntry.name,
+        };
+      }
+    } catch {}
+  }
+
+  return undefined;
+}
+
+function resolveArtifactImportPath(
+  targetProject: ProjectInfo,
+  artifactEntry: TranscriptBundleArtifactEntry
+): string {
+  if (artifactEntry.kind === "transcript") {
+    const relativePath =
+      artifactEntry.sourceRelativePath ??
+      `${artifactEntry.conversationId}/${path.basename(artifactEntry.conversationId)}.jsonl`;
+    return path.join(targetProject.fullPath, "agent-transcripts", ...relativePath.split("/"));
+  }
+
+  if (artifactEntry.kind === "store") {
+    return path.join(
+      resolveChatsRoot(),
+      targetProject.folderName,
+      artifactEntry.conversationId,
+      "store.db"
+    );
+  }
+
+  return path.join(
+    targetProject.fullPath,
+    "agent-transcripts",
+    artifactEntry.conversationId,
+    "cursor-sidebar-metadata.json"
+  );
+}
+
+function toSortedRecord<T>(entries: Array<[string, T]>): Record<string, T> {
+  return Object.fromEntries(entries.sort(([a], [b]) => a.localeCompare(b)));
 }

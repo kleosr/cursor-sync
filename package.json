@@ -2,7 +2,7 @@
   "name": "cursor-sync",
   "displayName": "Cursor Sync",
   "description": "Sync user-level Cursor settings and assets to a private GitHub Gist",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "icon": "assets/icon.png",
   "publisher": "MarceloBarella",
   "repository": {
@@ -86,19 +86,19 @@
       },
       {
         "command": "cursorSync.export",
-        "title": "Cursor Sync: Export Settings to Public Gist"
+        "title": "Cursor Sync: Export Settings to Private Gist"
       },
       {
         "command": "cursorSync.import",
-        "title": "Cursor Sync: Import Settings from Public Gist"
+        "title": "Cursor Sync: Import Settings from Private Gist"
       },
       {
         "command": "cursorSync.exportTranscripts",
-        "title": "Cursor Sync: Export Agent Transcripts to Public Gist"
+        "title": "Cursor Sync: Export Agent Transcripts to Private Gist"
       },
       {
         "command": "cursorSync.importTranscripts",
-        "title": "Cursor Sync: Import Agent Transcripts from Public Gist"
+        "title": "Cursor Sync: Import Agent Transcripts from Private Gist"
       }
     ],
     "configuration": {

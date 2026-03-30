@@ -1,0 +1,3 @@
+{"role":"user","content":[{"type":"text","text":"Summarize the latest transcript fidelity guarantees."}]}
+{"role":"assistant","content":[{"type":"reasoning","text":"Need to explain what the current transcript export/import keeps exactly."},{"type":"text","text":"The selected JSONL transcript bytes are preserved exactly across export and import."},{"type":"tool-call","toolName":"readFile","args":{"path":"README.md"}}]}
+{"role":"tool","content":[{"type":"tool-result","toolName":"readFile","output":"# Cursor Sync\nTranscript export/import preserves selected JSONL files only."}]}

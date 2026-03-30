@@ -1,0 +1,14 @@
+{
+  "composerHeaders": {
+    "allComposers": [
+      {
+        "composerId": "conversation-123",
+        "name": "Transcript Fidelity Check",
+        "subtitle": "Source sidebar snapshot",
+        "lastUpdatedAt": "2026-03-30T12:00:00.000Z",
+        "isArchived": false,
+        "hasUnread": false
+      }
+    ]
+  }
+}

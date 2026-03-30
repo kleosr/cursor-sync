@@ -49,7 +49,7 @@ export async function executeExport(context: vscode.ExtensionContext): Promise<v
 
   const selectedItems = await vscode.window.showQuickPick(items, {
     canPickMany: true,
-    title: "Select files to export to a public Gist",
+    title: "Select files to export to a private Gist",
   });
 
   if (!selectedItems || selectedItems.length === 0) {
@@ -78,12 +78,12 @@ export async function executeExport(context: vscode.ExtensionContext): Promise<v
   vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Creating public Gist...",
+      title: "Creating private Gist...",
       cancellable: false,
     },
     async () => {
       const result = await withRetry(() =>
-        client.createGist(gistFiles, "Cursor Sync - Public Export", true)
+        client.createGist(gistFiles, "Cursor Sync - Export")
       );
 
       if (!result.ok) {
@@ -98,7 +98,7 @@ export async function executeExport(context: vscode.ExtensionContext): Promise<v
       logger.appendLine(`[${new Date().toISOString()}] Export succeeded: ${gistUrl}`);
 
       const action = await vscode.window.showInformationMessage(
-        `Export successful! Gist created at ${gistUrl}`,
+        `Export successful! Private Gist at ${gistUrl}. Anyone with the link can open it.`,
         "Copy URL"
       );
 

@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "agentId": "conversation-123",
+    "latestRootBlobId": "blob-001",
+    "name": "Transcript Fidelity Check",
+    "createdAt": "2026-03-30T12:00:00.000Z"
+  },
+  "blobs": [
+    {
+      "id": "blob-001",
+      "kind": "message",
+      "payload": {
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need to explain what is preserved."
+          },
+          {
+            "type": "tool-result",
+            "toolName": "readFile",
+            "output": "# Cursor Sync"
+          }
+        ]
+      }
+    }
+  ]
+}

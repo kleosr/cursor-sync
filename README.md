@@ -1,6 +1,6 @@
 # Cursor Sync
 
-Sync user-level Cursor settings and `~/.cursor` assets to a private GitHub Gist, with manual push/pull, optional scheduled pull-push, export/import via public Gists, and configurable extension sync.
+Sync user-level Cursor settings and `~/.cursor` assets to a private GitHub Gist, with manual push/pull, optional scheduled pull-push, export/import via private Gists (anyone with the gist URL can still open it), and configurable extension sync.
 
 ## What Is Synced
 
@@ -74,8 +74,8 @@ The following are always excluded from sync:
 | `Cursor Sync: Show Status` | Display last sync time, direction, file count, and Gist URL |
 | `Cursor Sync: Resolve Conflicts` | Resolve files that changed both locally and remotely (shown when conflicts exist) |
 | `Cursor Sync: Reset Extension State` | Clear token, sync state, and reset extension settings to defaults |
-| `Cursor Sync: Export Settings to Public Gist` | Export selected files to a new **public** Gist (shareable link; requires token) |
-| `Cursor Sync: Import Settings from Public Gist` | Import settings from a public Gist by URL or ID (token optional for public Gists) |
+| `Cursor Sync: Export Settings to Private Gist` | Export selected files to a new **private** Gist; requires token; anyone with the URL can open the gist |
+| `Cursor Sync: Import Settings from Private Gist` | Import settings from a Gist by URL or ID using the GitHub API (configure a token for private gists) |
 
 ## Sidebar
 
@@ -105,8 +105,17 @@ Commands such as Resolve Conflicts and Reset are available from the Command Pale
 
 ## Export and Import
 
-- **Export**: Run **Cursor Sync: Export Settings to Public Gist**. You choose which synced files to include; a new **public** Gist is created and the URL can be copied to share (e.g. with others or for backup). Requires a configured GitHub token.
-- **Import**: Run **Cursor Sync: Import Settings from Public Gist** and enter a Gist URL or ID. You choose which files to apply locally. Public Gists can be read without a token; the extension still uses the token if configured.
+- **Export**: Run **Cursor Sync: Export Settings to Private Gist**. You choose which synced files to include; a new **private** Gist is created and the URL can be copied to share (e.g. with others or for backup). Requires a configured GitHub token. Anyone with the link can open the gist.
+- **Import**: Run **Cursor Sync: Import Settings from Private Gist** and enter a Gist URL or ID. You choose which files to apply locally. The extension uses your configured token to fetch the gist via the GitHub API (required for private gists).
+
+## Agent Transcript Export and Import
+
+- **Export**: Run **Cursor Sync: Export Agent Transcripts to Private Gist**. The extension exports selected `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` files and writes a `transcript-manifest.json` that records the source project, file checksum, and byte size for each transcript.
+- **Import**: Run **Cursor Sync: Import Agent Transcripts from Private Gist**. Each source project must be mapped to a local Cursor project before the selected transcript files are written into that project's `agent-transcripts/` directory.
+- **Fidelity guarantee**: Selected transcript JSONL files are preserved as exact UTF-8 bytes across export and import. Automated tests cover checksum-backed export, exact byte preservation for `user`, `assistant`, and `tool` transcript rows, and continued import compatibility for `schemaVersion: 1` manifests.
+- **Compatibility note**: Import currently tolerates higher manifest versions when they still include the existing `type`, `sourceProjects`, and `files` structure, but extra fidelity artifacts are ignored.
+- **Current limitation**: Transcript export/import does not yet capture or restore `~/.cursor/chats/**/store.db`, `state.vscdb`, sidebar composer headers, unread state, or recency metadata. Imported transcripts are therefore a file-level backup, not a guaranteed recreation of Cursor sidebar rows or full in-product chat rendering.
+- **Verification**: Use the manual playbook in [`docs/transcript-simulation-verification.md`](docs/transcript-simulation-verification.md) to validate checksum parity, byte-for-byte transcript equality, and the current simulation gaps.
 
 ## Extension List Sync
 
@@ -121,7 +130,7 @@ Extensions are installed at the latest available version; the synced list record
 ## Security
 
 - Your GitHub PAT is stored exclusively in VS Code SecretStorage. It never appears in settings files, logs, or telemetry.
-- Sync uses a single **private** Gist per token (identified by description "Cursor Sync - Settings Backup"). Export creates **public** Gists only when you explicitly run Export.
+- Sync uses a single **private** Gist per token (identified by description "Cursor Sync - Settings Backup"). Export creates an additional **private** Gist when you explicitly run Export; anyone with that URL can open it.
 - No data is sent to any service other than the GitHub Gist API for sync and export operations.
 - **Anonymous usage metrics**: The extension may send anonymous usage metrics (e.g. sync completed/failed, feature usage) to improve the extension. No sensitive data—tokens, gist IDs, file paths, or error messages—is included.
 
