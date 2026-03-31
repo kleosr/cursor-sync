@@ -566,7 +566,13 @@ describe("transcript export and import fidelity", () => {
           items.find((item) => item.description === targetProjectKey)
       )
       .mockImplementationOnce(async (items: Array<{ label?: string }>) => items);
-    showWarningMessageMock.mockResolvedValue("Import");
+    showInformationMessageMock.mockImplementation((msg: unknown) => {
+      const s = String(msg);
+      if (s.includes("Use the Import action")) {
+        return Promise.resolve("Import");
+      }
+      return Promise.resolve(undefined);
+    });
 
     const { executeImportTranscripts } = await import("../src/transcripts.js");
     await executeImportTranscripts(extensionContext as never);
@@ -581,9 +587,11 @@ describe("transcript export and import fidelity", () => {
 
     expect(importedContent).toBe(transcriptFixture);
     expect(showErrorMessageMock).not.toHaveBeenCalled();
-    expect(showInformationMessageMock).toHaveBeenCalledWith(
-      expect.stringContaining("Transcript import complete: 2 artifact(s) written"),
-    );
+    expect(
+      showInformationMessageMock.mock.calls.some((c) =>
+        String(c[0]).includes("Transcript import complete: 2 artifact(s) written")
+      )
+    ).toBe(true);
   });
 
   it("imports v2 bundle with store into mapped project chats path and surfaces restore coverage", async () => {
@@ -641,7 +649,13 @@ describe("transcript export and import fidelity", () => {
           items.find((item) => item.description === targetProjectKey)
       )
       .mockImplementationOnce(async (items: Array<{ label?: string }>) => items);
-    showWarningMessageMock.mockResolvedValue("Import");
+    showInformationMessageMock.mockImplementation((msg: unknown) => {
+      const s = String(msg);
+      if (s.includes("Use the Import action")) {
+        return Promise.resolve("Import");
+      }
+      return Promise.resolve(undefined);
+    });
 
     const { executeImportTranscripts } = await import("../src/transcripts.js");
     await executeImportTranscripts(extensionContext as never);
@@ -672,10 +686,12 @@ describe("transcript export and import fidelity", () => {
     expect(await fs.readFile(expectedStorePath)).toEqual(storeBuffer);
     expect(showErrorMessageMock).not.toHaveBeenCalled();
 
-    const completion = String(showInformationMessageMock.mock.calls[0]?.[0] ?? "");
-    expect(completion).toContain("Transcript import complete: 3 artifact(s) written");
-    expect(completion).toContain("Restored: transcript files 1, store.db 1, sidebar JSON 1");
-    expect(completion).toContain("state.vscdb");
+    const completionMsg = showInformationMessageMock.mock.calls
+      .map((c) => String(c[0]))
+      .find((s) => s.includes("Transcript import complete: 3 artifact(s) written"));
+    expect(completionMsg).toBeDefined();
+    expect(completionMsg).toContain("Restored: transcript files 1, store.db 1, sidebar JSON 1");
+    expect(completionMsg).toContain("state.vscdb");
   });
 
   it("keeps schemaVersion 1 transcript imports working", async () => {
@@ -698,6 +714,12 @@ describe("transcript export and import fidelity", () => {
       content: transcriptFixture,
     });
 
+    const storeBuffer = Buffer.from(storeFixture, "utf-8");
+    const storeEncoded = encodeTranscriptArtifact(storeBuffer, true);
+    const storeArtifactGistName = syncKeyToGistFileName(
+      bundleArtifactSyncKey(sourceProjectKey, "conversation-123", "store", "store.db")
+    );
+
     getGistMock.mockResolvedValue({
       ok: true,
       data: {
@@ -712,6 +734,7 @@ describe("transcript export and import fidelity", () => {
           [syncKeyToGistFileName(
             bundleArtifactSyncKey(sourceProjectKey, "conversation-123", "sidebar", "sidebar-metadata.json")
           )]: { content: sidebarFixture },
+          [storeArtifactGistName]: { content: storeEncoded.content },
         },
         created_at: "2026-03-30T12:00:00.000Z",
         updated_at: "2026-03-30T12:00:00.000Z",
@@ -731,7 +754,13 @@ describe("transcript export and import fidelity", () => {
             path.join(targetProjectDir, "agent-transcripts", "conversation-123", "conversation-123.jsonl")
         )
       );
-    showWarningMessageMock.mockResolvedValue("Import");
+    showInformationMessageMock.mockImplementation((msg: unknown) => {
+      const s = String(msg);
+      if (s.includes("Use the Import action")) {
+        return Promise.resolve("Import");
+      }
+      return Promise.resolve(undefined);
+    });
 
     const { executeImportTranscripts } = await import("../src/transcripts.js");
     await executeImportTranscripts(extensionContext as never);
@@ -742,8 +771,32 @@ describe("transcript export and import fidelity", () => {
       "conversation-123",
       "conversation-123.jsonl"
     );
+    const expectedSidebarPath = path.join(
+      targetProjectDir,
+      "agent-transcripts",
+      "conversation-123",
+      "cursor-sidebar-metadata.json"
+    );
+    const expectedStorePath = path.join(
+      tmpRoot,
+      ".cursor",
+      "chats",
+      targetProjectKey,
+      "conversation-123",
+      "store.db"
+    );
+
     expect(await fs.readFile(importedPath, "utf-8")).toBe(transcriptFixture);
+    expect(await fs.readFile(expectedSidebarPath, "utf-8")).toBe(sidebarFixture);
+    expect(await fs.readFile(expectedStorePath)).toEqual(storeBuffer);
     expect(showErrorMessageMock).not.toHaveBeenCalled();
+
+    const completionMsg = showInformationMessageMock.mock.calls
+      .map((c) => String(c[0]))
+      .find((s) => s.includes("Transcript import complete: 3 artifact(s) written"));
+    expect(completionMsg).toBeDefined();
+    expect(completionMsg).toContain("Restored: transcript files 1, store.db 1, sidebar JSON 1");
+    expect(completionMsg).toContain("state.vscdb");
   });
 
   it("fails schemaVersion 1 import on checksum mismatch", async () => {

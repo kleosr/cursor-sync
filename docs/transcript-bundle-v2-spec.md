@@ -15,7 +15,7 @@ This document defines the Phase 2 bundle format for high-fidelity transcript exp
 Bundle v2 is responsible for three artifact families:
 
 - Project transcript files from `agent-transcripts`.
-- Sidebar metadata snapshots derived from `ItemTable["composer.composerHeaders"]` and optional UI state keys.
+- Sidebar metadata snapshots derived from `ItemTable["composer.composerHeaders"]`, optional `ItemTable["composer.composerData"]`, and optional UI state keys.
 - Per-chat `store.db` snapshots from `~/.cursor/chats/<workspace_hash>/<agent_uuid>/store.db`.
 
 Bundle v2 is not responsible for:
@@ -248,7 +248,8 @@ Artifact keys are the stable ids used inside `manifest.artifacts`. Their seriali
 | Kind | Content rule | Required |
 | --- | --- | --- |
 | `transcript-jsonl` | Raw JSONL file bytes. UTF-8 if valid, otherwise base64. | Yes |
-| `sidebar-composer-header` | One JSON object containing the filtered `composer.composerHeaders.allComposers[]` entry for a single `composerId`. | Yes |
+| `sidebar-composer-header` | One JSON object containing filtered `composer.composerHeaders` entries for exported composer ids. | Yes |
+| `sidebar-composer-data` | Optional JSON object containing filtered `composer.composerData` slices for exported composer ids. | No |
 | `sidebar-ui-state` | Small JSON object of selected focus/visibility keys and values from `state.vscdb`. | No |
 | `store-meta-row` | Decoded JSON for hex-encoded rows when possible. Preserve original bytes if a row is not decodable. | Yes |
 | `store-blob-json` | Raw JSON blob bytes stored as UTF-8. | Yes |
@@ -270,6 +271,7 @@ Artifact keys are the stable ids used inside `manifest.artifacts`. Their seriali
    - create or update `conversations[rootComposerId]`
    - attach transcript artifacts
    - read `composer.composerHeaders` once and add filtered header snapshots for the root composer id and child composer ids found in the transcript tree
+   - read `composer.composerData` once and add filtered composer-data snapshot slices keyed to the same composer ids when available
    - attach optional UI-state snapshots for selected keys if present
    - attach zero or more store snapshots only when the exporter has direct evidence for the relevant `workspaceHash` and `agentId`
 4. For each selected `store.db`, export every row from `meta` and `blobs`.
@@ -287,13 +289,16 @@ Artifact keys are the stable ids used inside `manifest.artifacts`. Their seriali
    - ask the user to map source `projectKey` values to local projects, as v1 already does
    - write transcript artifacts into `targetProject/agent-transcripts/...`
    - restore each selected store snapshot into `~/.cursor/chats/<workspaceHash>/<agentId>/store.db` using staged writes and rollback on failure
-   - stage sidebar snapshots separately; if direct injection is not supported, surface a warning instead of failing the whole import
+   - stage sidebar snapshots separately and merge `composer.composerHeaders` plus optional `composer.composerData` additively by `composerId`
+   - keep imports backward compatible when `composer.composerData` is absent
+   - after successful state merge, prompt the user to reload the Cursor window to pick up SQLite-backed state updates
 4. Missing optional artifacts should warn, not fail.
 5. Missing required artifacts should fail the affected conversation before any partial write is finalized.
 
 ## Compatibility Strategy From `schemaVersion: 1`
 
 - Import must continue accepting v1 manifests exactly as they exist today.
+- Import must continue accepting v2 bundles that include only headers (no `composer.composerData`).
 - v1 imports remain transcript-only restores:
   - map source projects
   - write JSONL files

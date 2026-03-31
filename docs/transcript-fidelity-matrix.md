@@ -33,7 +33,8 @@ This document defines the Phase 2 fidelity target for transcript import/export b
 | --- | --- | --- | --- | --- |
 | Transcript JSONL bytes | Required | `src/transcripts.ts` already reads and writes raw `agent-transcripts/**/*.jsonl` files. | Preserved on export and import. | Keep as-is in v2. Continue preserving raw bytes and checksums. |
 | Transcript identity in composer-id domain | Required | Local transcript folders and subagent files align with `composer.composerHeaders` ids such as `b9283093-...` and `75e6483f-...`. | Preserved only implicitly through path names. | Record root composer id and child composer ids explicitly in the v2 manifest. |
-| Sidebar row metadata | Required | `ItemTable["composer.composerHeaders"]` includes `composerId`, `name`, `subtitle`, `createdAt`, `lastUpdatedAt`, `hasUnreadMessages`, `isArchived`, `isDraft`, `unifiedMode`, `forceMode`, `subagentInfo`. | Lost. | Export filtered header snapshots for every selected root composer and child composer. |
+| Sidebar row metadata | Required | `ItemTable["composer.composerHeaders"]` includes `composerId`, `name`, `subtitle`, `createdAt`, `lastUpdatedAt`, `hasUnreadMessages`, `isArchived`, `isDraft`, `unifiedMode`, `forceMode`, `subagentInfo`. | Lost. | Export filtered header snapshots for every selected root composer and child composer; import merges additively by `composerId`. |
+| Sidebar list/selection driver payload | Optional (recommended) | Reference behavior maps list identity/order/selection to `ItemTable["composer.composerData"]`. | Lost. | Export filtered `composer.composerData` slices when present; import merges additively by `composerId` and remains compatible if absent. |
 | Sidebar recency and display ordering signals | Required | Same `composer.composerHeaders` entries carry `lastUpdatedAt` and archive/unread flags used for list rendering decisions. | Lost. | Preserve the per-composer header fields exactly as observed, not recomputed. |
 | Sidebar focus and visibility state | Optional | Local `state.vscdb` keys include `cursor/glass.sidebarVisible`, `glass/cursor.editorPanelVisibility.agent/<id>`, `workbench.panel.composerChatViewPane.<id>.hidden`, `cursor/agentLayout.sidebarLocation*`. | Lost. | Capture a small best-effort snapshot so import can restore or warn, but do not block conversation import if these keys are missing. |
 | Chat-store meta root | Required | `store.db.meta.key = "0"` decodes to JSON with `agentId`, `latestRootBlobId`, `name`, `mode`, `createdAt`. | Lost. | Export every selected `meta` row, at minimum key `0`, as structured JSON plus checksum. |
@@ -48,6 +49,7 @@ This document defines the Phase 2 fidelity target for transcript import/export b
 
 - Raw transcript JSONL files exactly as currently exported.
 - A filtered sidebar snapshot derived from `composer.composerHeaders` for the selected root composer and any selected child composer ids.
+- Optional filtered sidebar snapshot derived from `composer.composerData` for the selected root composer and any selected child composer ids when available.
 - A full snapshot of each selected per-chat `store.db`:
   - every row in `meta`
   - every row in `blobs`
@@ -61,6 +63,7 @@ This document defines the Phase 2 fidelity target for transcript import/export b
 
 - Best-effort UI focus and visibility keys from `state.vscdb`.
 - Import warnings when those keys are unavailable or when a conversation can be restored only as transcript plus store data without exact sidebar focus restoration.
+- Reload guidance when state DB merges succeed because Cursor may not hot-reload SQLite-backed composer state.
 
 ## Non-Goals For Phase 2
 

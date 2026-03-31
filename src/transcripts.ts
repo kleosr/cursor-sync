@@ -48,8 +48,55 @@ const execFile = promisify(execFileCallback);
 const execFileWithInput = execFile as (
   command: string,
   args: readonly string[] | undefined,
-  options: { input: string; maxBuffer: number }
+  options: { input: string; maxBuffer: number; timeout?: number }
 ) => Promise<{ stdout: string; stderr: string }>;
+
+const SQLITE_SUBPROCESS_TIMEOUT_MS = 20_000;
+const FILE_ACCESS_TIMEOUT_MS = 12_000;
+
+function isExecFileTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const e = error as { killed?: boolean; code?: string; message?: string };
+  if (e.killed === true) {
+    return true;
+  }
+  if (e.code === "ETIMEDOUT") {
+    return true;
+  }
+  const msg = typeof e.message === "string" ? e.message : "";
+  return msg.includes("timed out") || msg.includes("ETIMEDOUT");
+}
+
+async function accessPathOutcome(absPath: string): Promise<"exists" | "missing" | "timeout"> {
+  let settled = false;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve("timeout");
+      }
+    }, FILE_ACCESS_TIMEOUT_MS);
+    fs.access(absPath)
+      .then(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve("exists");
+      })
+      .catch(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve("missing");
+      });
+  });
+}
 
 interface ExportConversationState {
   projectKey: string;
@@ -730,8 +777,15 @@ async function importTranscriptBundleV1(
     selectedPaths.has(operation.absolutePath)
   );
 
-  await previewAndApplyImportPlan(context, selectedOperations, "Import transcript files", logger, {
-    importRestoreReport: false,
+  const augmented = await augmentV1ImportOperations(
+    gistData,
+    selectedOperations,
+    projectMapping,
+    logger
+  );
+
+  await previewAndApplyImportPlan(context, augmented, "Import transcript files", logger, {
+    importRestoreReport: true,
   });
 }
 
@@ -956,6 +1010,57 @@ async function previewAndApplyImportPlan(
   const preview = await previewRestoreOperations(operations);
 
   if (preview.newFiles.length === 0 && preview.conflicts.length === 0) {
+    const sidebarOps = preview.unchanged.filter((op) => op.kind === "sidebar");
+    if (options.importRestoreReport && sidebarOps.length > 0) {
+      try {
+        const stateOutcome = await applySidebarStateRestoration(context, sidebarOps, logger);
+        const report = mergeStateOutcomeIntoReport(
+          {
+            transcriptWritten: 0,
+            storeWritten: 0,
+            sidebarWritten: 0,
+            stateDbMerged: 0,
+            stateDbSkippedNoPayload: 0,
+            stateDbSkippedNoDb: 0,
+            statePartial: false,
+            warnings: [],
+          },
+          stateOutcome
+        );
+        const warningParts = [
+          ...(options.warnings ?? []),
+          ...(report.warnings ?? []),
+        ];
+        const warningSuffix =
+          warningParts.length > 0 ? ` Warnings: ${warningParts.slice(0, 5).join(" ")}` : "";
+        const detailSuffix = ` State.vscdb merges ${report.stateDbMerged}. Skipped state merge (no composer payload) ${report.stateDbSkippedNoPayload}, (no DB) ${report.stateDbSkippedNoDb}.${report.statePartial ? " Partial state restoration." : ""}`;
+        vscode.window.showInformationMessage(
+          `Transcript import: artifacts already on disk; re-applied sidebar state.${detailSuffix}${warningSuffix}`
+        );
+        if (report.stateDbMerged > 0) {
+          const reloadAction = "Reload Window";
+          const selected = await vscode.window.showInformationMessage(
+            "Sidebar state was updated on disk. Reload Cursor to pick up imported conversation visibility.",
+            reloadAction
+          );
+          if (selected === reloadAction) {
+            await vscode.commands.executeCommand("workbench.action.reloadWindow");
+          }
+        }
+        logger.appendLine(
+          `[${new Date().toISOString()}] Transcript import (unchanged files): stateMerged=${report.stateDbMerged} skippedPayload=${report.stateDbSkippedNoPayload} skippedDb=${report.stateDbSkippedNoDb}`
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(
+          `Transcript import: sidebar state merge failed: ${msg}`
+        );
+        logger.appendLine(
+          `[${new Date().toISOString()}] Transcript import (unchanged files) state merge error: ${msg}`
+        );
+      }
+      return;
+    }
     vscode.window.showInformationMessage(
       `${actionLabel} skipped: all selected artifacts are already up to date.`
     );
@@ -986,8 +1091,8 @@ async function previewAndApplyImportPlan(
 
     conflictPolicy = choice === "Skip Conflicts" ? "skip" : "overwrite";
   } else {
-    const choice = await vscode.window.showWarningMessage(
-      `${actionLabel}: ${summary}. Continue?`,
+    const choice = await vscode.window.showInformationMessage(
+      `${actionLabel}: ${summary}. Use the Import action to write files and update sidebar state.`,
       { modal: true },
       "Import",
       "Cancel"
@@ -1050,6 +1155,16 @@ async function previewAndApplyImportPlan(
     `Transcript import complete: ${result.writtenCount} artifact(s) written, ${preview.unchanged.length} unchanged, ` +
       `${conflictPolicy === "skip" ? preview.conflicts.length : 0} conflict(s) skipped.${detailSuffix}${warningSuffix}`
   );
+  if ((report?.stateDbMerged ?? 0) > 0) {
+    const reloadAction = "Reload Window";
+    const selected = await vscode.window.showInformationMessage(
+      "Sidebar state was updated on disk. Reload Cursor to pick up imported conversation visibility.",
+      reloadAction
+    );
+    if (selected === reloadAction) {
+      await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    }
+  }
   logger.appendLine(
     `[${new Date().toISOString()}] Transcript import succeeded: ${result.writtenCount} artifacts` +
       (report
@@ -1096,18 +1211,30 @@ async function applyRestoreOperations(
   const createdPaths: string[] = [];
 
   for (const operation of operations) {
-    try {
-      await fs.access(operation.absolutePath);
+    const outcome = await accessPathOutcome(operation.absolutePath);
+    if (outcome === "timeout") {
+      logger.appendLine(
+        `[${new Date().toISOString()}] Transcript import: access timed out for ${operation.absolutePath}`
+      );
+      return {
+        ok: false,
+        message:
+          "Transcript import failed: a destination path did not respond in time (slow disk, network folder, or permission issue).",
+      };
+    }
+    if (outcome === "exists") {
       existingPaths.push(operation.absolutePath);
-    } catch {
+    } else {
       createdPaths.push(operation.absolutePath);
     }
   }
 
   const { entries: backupEntries } = await createBackup(context, existingPaths);
+
   let writtenCount = 0;
 
-  for (const operation of operations) {
+  for (let i = 0; i < operations.length; i += 1) {
+    const operation = operations[i]!;
     try {
       await fs.mkdir(path.dirname(operation.absolutePath), { recursive: true });
       const tmpPath = `${operation.absolutePath}.tmp`;
@@ -1130,6 +1257,7 @@ async function applyRestoreOperations(
   }
 
   await pruneOldBackups(context);
+
   return { ok: true, writtenCount };
 }
 
@@ -1143,15 +1271,32 @@ async function buildSidebarMetadataSnapshot(
   );
   const evidence = await extractSidebarStateEvidence(conversationState.conversationId);
 
+  const composerIds = collectComposerIdsForConversation(conversationState);
   let composerHeadersRestore: unknown;
+  let composerDataRestore: unknown;
   if (evidence?.stateDbPath) {
-    const rows = await querySqliteRows(
-      evidence.stateDbPath,
-      "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders' LIMIT 1;"
-    );
-    const raw = rows[0]?.value;
-    if (raw != null) {
-      composerHeadersRestore = coerceSqliteValue(raw);
+    try {
+      const headerRows = await querySqliteRows(
+        evidence.stateDbPath,
+        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders' LIMIT 1;"
+      );
+      const headerRaw = headerRows[0]?.value;
+      if (headerRaw != null) {
+        composerHeadersRestore = coerceSqliteValue(headerRaw);
+      }
+      const dataRows = await querySqliteRows(
+        evidence.stateDbPath,
+        "SELECT value FROM ItemTable WHERE key = 'composer.composerData' LIMIT 1;"
+      );
+      const dataRaw = dataRows[0]?.value;
+      if (dataRaw != null) {
+        const parsedComposerData = coerceSqliteValue(dataRaw);
+        composerDataRestore = filterComposerDataPayload(parsedComposerData, composerIds);
+      }
+    } catch (error) {
+      if (!isExecFileTimeoutError(error)) {
+        throw error;
+      }
     }
   }
   const fallbackComposerHeaders = buildFallbackComposerHeadersPayload(
@@ -1186,8 +1331,226 @@ async function buildSidebarMetadataSnapshot(
     composerSummaryRows: evidence?.composerSummaryRows ?? [],
     composerHeaders: composerHeadersPayload,
     composerHeadersRestore: composerHeadersRestore ?? null,
+    composerData: composerDataRestore ?? null,
+    composerDataRestore: composerDataRestore ?? null,
     warnings: [...conversationState.warnings].sort(),
   };
+}
+
+function getSourceProjectKeyFromTranscriptSyncKey(syncKey: string): string | undefined {
+  const prefix = "transcripts/";
+  if (!syncKey.startsWith(prefix)) {
+    return undefined;
+  }
+  const rest = syncKey.slice(prefix.length);
+  const slash = rest.indexOf("/");
+  if (slash <= 0) {
+    return slash === -1 && rest.length > 0 ? rest : undefined;
+  }
+  return rest.slice(0, slash);
+}
+
+function decodeTolerantStoreGistContent(raw: string): Buffer {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return Buffer.alloc(0);
+  }
+  const noWs = trimmed.replace(/\s/g, "");
+  try {
+    const asB64 = Buffer.from(noWs, "base64");
+    if (asB64.length >= 16 && asB64.subarray(0, 15).toString("latin1") === "SQLite format 3") {
+      return asB64;
+    }
+    if (noWs.length > 0 && /^[A-Za-z0-9+/]+=*$/.test(noWs) && noWs.length % 4 === 0) {
+      return asB64;
+    }
+  } catch {
+  }
+  return decodeTranscriptArtifact(trimmed, undefined);
+}
+
+async function augmentV1ImportOperations(
+  gistData: GistResponse,
+  transcriptOperations: RestoreOperation[],
+  projectMapping: ReadonlyMap<string, ProjectInfo>,
+  logger: ReturnType<typeof getLogger>
+): Promise<RestoreOperation[]> {
+  const extra: RestoreOperation[] = [];
+  const seenStores = new Set<string>();
+  const seenSidebars = new Set<string>();
+
+  const groups = new Map<
+    string,
+    {
+      sourceProjectKey: string;
+      conversationId: string;
+      targetProject: ProjectInfo;
+      ops: RestoreOperation[];
+    }
+  >();
+
+  for (const op of transcriptOperations) {
+    const sourcePk = getSourceProjectKeyFromTranscriptSyncKey(op.syncKey);
+    if (!sourcePk || !op.conversationId) {
+      continue;
+    }
+    const targetProject = projectMapping.get(sourcePk);
+    if (!targetProject) {
+      continue;
+    }
+    const gkey = `${sourcePk}:${op.conversationId}`;
+    let g = groups.get(gkey);
+    if (!g) {
+      g = { sourceProjectKey: sourcePk, conversationId: op.conversationId, targetProject, ops: [] };
+      groups.set(gkey, g);
+    }
+    g.ops.push(op);
+  }
+
+  const createdAt = new Date().toISOString();
+  const sortedGroups = [...groups.values()].sort((a, b) =>
+    a.sourceProjectKey !== b.sourceProjectKey
+      ? a.sourceProjectKey.localeCompare(b.sourceProjectKey)
+      : a.conversationId.localeCompare(b.conversationId)
+  );
+
+  for (const g of sortedGroups) {
+    const storeSyncKey = bundleArtifactSyncKey(
+      g.sourceProjectKey,
+      g.conversationId,
+      "store",
+      "store.db"
+    );
+    const sidebarSyncKey = bundleArtifactSyncKey(
+      g.sourceProjectKey,
+      g.conversationId,
+      "sidebar",
+      "sidebar-metadata.json"
+    );
+
+    const storeGist = gistData.files[syncKeyToGistFileName(storeSyncKey)];
+    if (storeGist && !seenStores.has(storeSyncKey)) {
+      seenStores.add(storeSyncKey);
+      const storeBuf = decodeTolerantStoreGistContent(storeGist.content);
+      if (storeBuf.length > 0) {
+        extra.push({
+          absolutePath: path.join(
+            resolveChatsRoot(),
+            g.targetProject.folderName,
+            g.conversationId,
+            "store.db"
+          ),
+          content: storeBuf,
+          checksum: computeArtifactChecksum(storeBuf),
+          syncKey: storeSyncKey,
+          kind: "store",
+          conversationId: g.conversationId,
+        });
+      } else {
+        logger.appendLine(
+          `[${new Date().toISOString()}] V1 import skipped empty store artifact for ${storeSyncKey}`
+        );
+      }
+    }
+
+    if (seenSidebars.has(sidebarSyncKey)) {
+      continue;
+    }
+    seenSidebars.add(sidebarSyncKey);
+
+    const sidebarGist = gistData.files[syncKeyToGistFileName(sidebarSyncKey)];
+    let sidebarBuffer: Buffer;
+    if (sidebarGist) {
+      sidebarBuffer = Buffer.from(sidebarGist.content, "utf-8");
+    } else {
+      const transcriptRelativePaths = [
+        ...new Set(
+          g.ops.map((op) => op.syncKey.slice(`transcripts/${g.sourceProjectKey}/`.length))
+        ),
+      ].sort();
+      let primaryContent = g.ops[0]!.content.toString("utf-8");
+      let primaryAt = transcriptRelativePaths[0] ?? "";
+      for (const op of g.ops) {
+        const rel = op.syncKey.slice(`transcripts/${g.sourceProjectKey}/`.length);
+        if (path.basename(rel, path.extname(rel)) === g.conversationId) {
+          primaryContent = op.content.toString("utf-8");
+          primaryAt = rel;
+          break;
+        }
+      }
+      const synthetic: ExportConversationState = {
+        projectKey: g.sourceProjectKey,
+        conversationId: g.conversationId,
+        transcriptArtifacts: [],
+        transcriptRelativePaths,
+        primaryTranscriptContent: primaryContent,
+        primaryTranscriptSelectedAt: primaryAt,
+        lastUpdatedAt: createdAt,
+        warnings: [],
+      };
+      const snapshot = await buildSidebarMetadataSnapshot(synthetic, createdAt);
+      sidebarBuffer = Buffer.from(JSON.stringify(snapshot, null, 2), "utf-8");
+    }
+
+    extra.push({
+      absolutePath: path.join(
+        g.targetProject.fullPath,
+        "agent-transcripts",
+        g.conversationId,
+        "cursor-sidebar-metadata.json"
+      ),
+      content: sidebarBuffer,
+      checksum: computeArtifactChecksum(sidebarBuffer),
+      syncKey: sidebarSyncKey,
+      kind: "sidebar",
+      conversationId: g.conversationId,
+    });
+  }
+
+  return [...transcriptOperations, ...extra].sort((a, b) => a.absolutePath.localeCompare(b.absolutePath));
+}
+
+function collectComposerIdsForConversation(conversationState: ExportConversationState): Set<string> {
+  const ids = new Set<string>([conversationState.conversationId]);
+  for (const relativePath of conversationState.transcriptRelativePaths) {
+    const baseName = path.basename(relativePath, path.extname(relativePath));
+    if (baseName) {
+      ids.add(baseName);
+    }
+  }
+  return ids;
+}
+
+function filterComposerDataPayload(value: unknown, composerIds: ReadonlySet<string>): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const source = value as Record<string, unknown>;
+  const filtered: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(source)) {
+    if (key === "allComposers" && Array.isArray(entry)) {
+      filtered[key] = entry.filter((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return false;
+        }
+        const id = getComposerId(item as Record<string, unknown>);
+        return id.length > 0 && composerIds.has(id);
+      });
+      continue;
+    }
+    if (composerIds.has(key)) {
+      filtered[key] = entry;
+    } else if (!isLikelyComposerIdKey(key)) {
+      filtered[key] = entry;
+    }
+  }
+  return filtered;
+}
+
+function isLikelyComposerIdKey(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value
+  );
 }
 
 function buildFallbackComposerHeadersPayload(
@@ -1220,18 +1583,28 @@ async function extractSidebarStateEvidence(
   const escapedConversationId = conversationId.replace(/'/g, "''");
 
   for (const stateDbPath of stateDbCandidates) {
-    const matchedItemTableRows = await querySqliteRows(
-      stateDbPath,
-      `SELECT key, value FROM ItemTable WHERE value LIKE '%${escapedConversationId}%' LIMIT 10;`
-    );
-    const matchedCursorDiskRows = await querySqliteRows(
-      stateDbPath,
-      `SELECT key, value FROM cursorDiskKV WHERE key LIKE '%${escapedConversationId}%' OR value LIKE '%${escapedConversationId}%' LIMIT 10;`
-    );
-    const composerSummaryRows = await querySqliteRows(
-      stateDbPath,
-      "SELECT key, length(value) AS valueLength FROM ItemTable WHERE key IN ('composer.composerHeaders', 'composer.composerData') LIMIT 5;"
-    );
+    let matchedItemTableRows: Array<Record<string, unknown>>;
+    let matchedCursorDiskRows: Array<Record<string, unknown>>;
+    let composerSummaryRows: Array<Record<string, unknown>>;
+    try {
+      matchedItemTableRows = await querySqliteRows(
+        stateDbPath,
+        `SELECT key, value FROM ItemTable WHERE value LIKE '%${escapedConversationId}%' LIMIT 10;`
+      );
+      matchedCursorDiskRows = await querySqliteRows(
+        stateDbPath,
+        `SELECT key, value FROM cursorDiskKV WHERE key LIKE '%${escapedConversationId}%' OR value LIKE '%${escapedConversationId}%' LIMIT 10;`
+      );
+      composerSummaryRows = await querySqliteRows(
+        stateDbPath,
+        "SELECT key, length(value) AS valueLength FROM ItemTable WHERE key IN ('composer.composerHeaders', 'composer.composerData') LIMIT 5;"
+      );
+    } catch (error) {
+      if (isExecFileTimeoutError(error)) {
+        continue;
+      }
+      throw error;
+    }
 
     if (
       matchedItemTableRows.length > 0 ||
@@ -1278,7 +1651,10 @@ async function querySqliteRows(
     return Array.isArray(parsed)
       ? parsed.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object")
       : [];
-  } catch {
+  } catch (error) {
+    if (isExecFileTimeoutError(error)) {
+      throw error;
+    }
     return [];
   }
 }
@@ -1287,8 +1663,9 @@ async function runSqliteQuery(
   dbPath: string,
   sql: string
 ): Promise<{ stdout: string; stderr: string }> {
+  const execOpts = { maxBuffer: 64 * 1024 * 1024, timeout: SQLITE_SUBPROCESS_TIMEOUT_MS };
   try {
-    return await execFile("sqlite3", ["-json", dbPath, sql]);
+    return await execFile("sqlite3", ["-json", dbPath, sql], execOpts);
   } catch (error) {
     if (!isCommandMissingError(error, "sqlite3")) {
       throw error;
@@ -1309,15 +1686,14 @@ async function runSqliteQuery(
       "print(json.dumps(rows))",
       "conn.close()",
     ].join(";");
-    return execFile("python3", ["-c", pyScript, dbPath, sql], {
-      maxBuffer: 64 * 1024 * 1024,
-    });
+    return execFile("python3", ["-c", pyScript, dbPath, sql], execOpts);
   }
 }
 
 async function runSqliteScript(dbPath: string, script: string): Promise<void> {
+  const execOpts = { input: script, maxBuffer: 64 * 1024 * 1024, timeout: SQLITE_SUBPROCESS_TIMEOUT_MS };
   try {
-    await execFileWithInput("sqlite3", [dbPath], { input: script, maxBuffer: 64 * 1024 * 1024 });
+    await execFileWithInput("sqlite3", [dbPath], execOpts);
     return;
   } catch (error) {
     if (!isCommandMissingError(error, "sqlite3")) {
@@ -1333,10 +1709,7 @@ async function runSqliteScript(dbPath: string, script: string): Promise<void> {
       "conn.commit()",
       "conn.close()",
     ].join(";");
-    await execFileWithInput("python3", ["-c", pyScript, dbPath], {
-      input: script,
-      maxBuffer: 64 * 1024 * 1024,
-    });
+    await execFileWithInput("python3", ["-c", pyScript, dbPath], execOpts);
   }
 }
 
@@ -1792,6 +2165,119 @@ function extractComposerHeadersPayload(
   return undefined;
 }
 
+function extractComposerDataPayload(
+  parsed: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const direct = parsed.composerData;
+  if (direct && typeof direct === "object" && !Array.isArray(direct)) {
+    return direct as Record<string, unknown>;
+  }
+  const restore = parsed.composerDataRestore;
+  if (restore && typeof restore === "object" && !Array.isArray(restore)) {
+    return restore as Record<string, unknown>;
+  }
+  const rows = parsed.matchedItemTableRows;
+  if (!Array.isArray(rows)) {
+    return undefined;
+  }
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    const rec = row as Record<string, unknown>;
+    if (rec.key !== "composer.composerData") {
+      continue;
+    }
+    const v = rec.value;
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      return v as Record<string, unknown>;
+    }
+    if (typeof v !== "string") {
+      continue;
+    }
+    const t = v.trim();
+    if (t.endsWith("…") || t.endsWith("...")) {
+      return undefined;
+    }
+    try {
+      const parsedInner = JSON.parse(t) as unknown;
+      if (parsedInner && typeof parsedInner === "object" && !Array.isArray(parsedInner)) {
+        return parsedInner as Record<string, unknown>;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function mergeComposerDataAdditive(
+  existingRaw: string | undefined,
+  importedPayloads: Array<Record<string, unknown>>
+): Record<string, unknown> {
+  const parseBlob = (raw: string | undefined): Record<string, unknown> => {
+    if (!raw || raw.trim().length === 0) {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {}
+    return {};
+  };
+
+  const mergeComposerArray = (
+    baseValue: unknown,
+    importedValue: unknown
+  ): Array<Record<string, unknown>> | undefined => {
+    if (!Array.isArray(baseValue) || !Array.isArray(importedValue)) {
+      return undefined;
+    }
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const entry of baseValue) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+      const rec = entry as Record<string, unknown>;
+      const id = getComposerId(rec);
+      if (id) {
+        byId.set(id, { ...rec });
+      }
+    }
+    for (const entry of importedValue) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+      const rec = entry as Record<string, unknown>;
+      const id = getComposerId(rec);
+      if (!id || byId.has(id)) {
+        continue;
+      }
+      byId.set(id, { ...rec });
+    }
+    return [...byId.values()];
+  };
+
+  let merged = parseBlob(existingRaw);
+  for (const imported of importedPayloads) {
+    const next: Record<string, unknown> = { ...merged };
+    for (const [key, value] of Object.entries(imported)) {
+      if (!(key in next)) {
+        next[key] = value;
+        continue;
+      }
+      const mergedArray = mergeComposerArray(next[key], value);
+      if (mergedArray) {
+        next[key] = mergedArray;
+      }
+    }
+    merged = next;
+  }
+  return merged;
+}
+
 function deriveComposerHeadersPayloadFromSidebarSnapshot(
   parsed: Record<string, unknown>
 ): Record<string, unknown> | undefined {
@@ -1858,7 +2344,11 @@ async function applySidebarStateRestoration(
     warnings: [],
   };
 
-  type Agg = { payloads: Array<Record<string, unknown>>; conversationIds: string[] };
+  type Agg = {
+    headerPayloads: Array<Record<string, unknown>>;
+    dataPayloads: Array<Record<string, unknown>>;
+    conversationIds: string[];
+  };
   const byDb = new Map<string, Agg>();
 
   for (const op of sidebarOps) {
@@ -1871,9 +2361,11 @@ async function applySidebarStateRestoration(
       continue;
     }
 
-    const payload = extractComposerHeadersPayload(parsed);
-    const effectivePayload = payload ?? deriveComposerHeadersPayloadFromSidebarSnapshot(parsed);
-    if (!effectivePayload) {
+    const headersPayload = extractComposerHeadersPayload(parsed);
+    const effectiveHeadersPayload =
+      headersPayload ?? deriveComposerHeadersPayloadFromSidebarSnapshot(parsed);
+    const dataPayload = extractComposerDataPayload(parsed);
+    if (!effectiveHeadersPayload && !dataPayload) {
       outcome.stateDbSkippedNoPayload += 1;
       continue;
     }
@@ -1896,8 +2388,17 @@ async function applySidebarStateRestoration(
     }
 
     const dbPath = paths[0]!;
-    const agg = byDb.get(dbPath) ?? { payloads: [], conversationIds: [] };
-    agg.payloads.push(effectivePayload);
+    const agg = byDb.get(dbPath) ?? {
+      headerPayloads: [],
+      dataPayloads: [],
+      conversationIds: [],
+    };
+    if (effectiveHeadersPayload) {
+      agg.headerPayloads.push(effectiveHeadersPayload);
+    }
+    if (dataPayload) {
+      agg.dataPayloads.push(dataPayload);
+    }
     if (op.conversationId) {
       agg.conversationIds.push(op.conversationId);
     }
@@ -1905,42 +2406,67 @@ async function applySidebarStateRestoration(
   }
 
   for (const [dbPath, agg] of byDb) {
-    let existingRaw: string | undefined;
+    let existingHeadersRaw: string | undefined;
+    let existingDataRaw: string | undefined;
     try {
       const rows = await querySqliteRows(
         dbPath,
-        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders' LIMIT 1;"
+        "SELECT key, value FROM ItemTable WHERE key IN ('composer.composerHeaders', 'composer.composerData');"
       );
-      const v = rows[0]?.value;
-      if (typeof v === "string") {
-        existingRaw = v;
-      } else if (v != null && typeof v === "object") {
-        existingRaw = JSON.stringify(v);
+      for (const row of rows) {
+        const key = String(row.key ?? "");
+        const value = row.value;
+        if (key === "composer.composerHeaders") {
+          if (typeof value === "string") {
+            existingHeadersRaw = value;
+          } else if (value != null && typeof value === "object") {
+            existingHeadersRaw = JSON.stringify(value);
+          }
+        }
+        if (key === "composer.composerData") {
+          if (typeof value === "string") {
+            existingDataRaw = value;
+          } else if (value != null && typeof value === "object") {
+            existingDataRaw = JSON.stringify(value);
+          }
+        }
       }
-    } catch {
-      outcome.warnings.push(`State DB ${dbPath}: read failed; merge skipped.`);
+    } catch (error) {
+      outcome.warnings.push(
+        isExecFileTimeoutError(error)
+          ? `State DB ${dbPath}: SQLite timed out (database may be locked); merge skipped.`
+          : `State DB ${dbPath}: read failed; merge skipped.`
+      );
       outcome.statePartial = true;
       continue;
     }
 
-    const merged = mergeComposerHeadersChain(existingRaw, agg.payloads);
-    const existingComposerCount = parseComposerHeadersBlob(existingRaw).allComposers.length;
-    const mergedComposerCount = merged.allComposers.length;
-    const mergedJson = JSON.stringify(merged);
-    const prior = JSON.stringify(parseComposerHeadersBlob(existingRaw));
-    if (mergedJson === prior) {
-      outcome.stateDbMerged += 1;
-      continue;
-    }
+    const mergedHeaders = mergeComposerHeadersChain(existingHeadersRaw, agg.headerPayloads);
+    const mergedHeadersJson = JSON.stringify(mergedHeaders);
+    const mergedData = mergeComposerDataAdditive(existingDataRaw, agg.dataPayloads);
+    const mergedDataJson = JSON.stringify(mergedData);
 
     const { entries: backupEntries } = await createBackup(context, [dbPath]);
     try {
-      const esc = escapeSqlLiteral(mergedJson);
-      const script = `BEGIN IMMEDIATE;\nUPDATE ItemTable SET value = '${esc}' WHERE key = 'composer.composerHeaders';\nINSERT INTO ItemTable (key, value) SELECT 'composer.composerHeaders', '${esc}' WHERE NOT EXISTS (SELECT 1 FROM ItemTable WHERE key = 'composer.composerHeaders');\nCOMMIT;\n`;
+      const escapedHeaders = escapeSqlLiteral(mergedHeadersJson);
+      const headerScript =
+        `UPDATE ItemTable SET value = '${escapedHeaders}' WHERE key = 'composer.composerHeaders';\n` +
+        `INSERT INTO ItemTable (key, value) SELECT 'composer.composerHeaders', '${escapedHeaders}' WHERE NOT EXISTS (SELECT 1 FROM ItemTable WHERE key = 'composer.composerHeaders');\n`;
+      const dataScript =
+        agg.dataPayloads.length > 0
+          ? (() => {
+              const escapedData = escapeSqlLiteral(mergedDataJson);
+              return (
+                `UPDATE ItemTable SET value = '${escapedData}' WHERE key = 'composer.composerData';\n` +
+                `INSERT INTO ItemTable (key, value) SELECT 'composer.composerData', '${escapedData}' WHERE NOT EXISTS (SELECT 1 FROM ItemTable WHERE key = 'composer.composerData');\n`
+              );
+            })()
+          : "";
+      const script = `BEGIN IMMEDIATE;\n${headerScript}${dataScript}COMMIT;\n`;
       await runSqliteScript(dbPath, script);
       outcome.stateDbMerged += 1;
       logger.appendLine(
-        `[${new Date().toISOString()}] Merged composer.composerHeaders in ${dbPath} for ${agg.conversationIds.join(",")}`
+        `[${new Date().toISOString()}] Merged composer state in ${dbPath} for ${agg.conversationIds.join(",")}`
       );
     } catch (error) {
       await rollbackFromBackup(backupEntries);
@@ -2014,3 +2540,10 @@ function resolveArtifactImportPath(
 function toSortedRecord<T>(entries: Array<[string, T]>): Record<string, T> {
   return Object.fromEntries(entries.sort(([a], [b]) => a.localeCompare(b)));
 }
+
+export const __transcriptsTestUtils = {
+  extractComposerHeadersPayload,
+  extractComposerDataPayload,
+  mergeComposerHeadersChain,
+  mergeComposerDataAdditive,
+};

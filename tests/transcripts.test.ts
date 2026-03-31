@@ -111,4 +111,39 @@ describe("transcripts", () => {
       expect(path.join(cursorDir, "chats")).toBe(path.join(os.homedir(), ".cursor", "chats"));
     });
   });
+
+  describe("sidebar state helpers", () => {
+    it("extracts composerData payload from sidebar snapshot object", async () => {
+      const { __transcriptsTestUtils } = await import("../src/transcripts.js");
+      const payload = __transcriptsTestUtils.extractComposerDataPayload({
+        composerData: {
+          "conversation-123": { composerId: "conversation-123", selected: true },
+        },
+      });
+      expect(payload).toEqual({
+        "conversation-123": { composerId: "conversation-123", selected: true },
+      });
+    });
+
+    it("merges composerData additively by composer key", async () => {
+      const { __transcriptsTestUtils } = await import("../src/transcripts.js");
+      const merged = __transcriptsTestUtils.mergeComposerDataAdditive(
+        JSON.stringify({
+          "conversation-123": { composerId: "conversation-123", selected: false },
+          stableMeta: { version: 1 },
+        }),
+        [
+          {
+            "conversation-123": { composerId: "conversation-123", selected: true },
+            "conversation-999": { composerId: "conversation-999", selected: true },
+          },
+        ]
+      );
+      expect(merged).toEqual({
+        "conversation-123": { composerId: "conversation-123", selected: false },
+        stableMeta: { version: 1 },
+        "conversation-999": { composerId: "conversation-999", selected: true },
+      });
+    });
+  });
 });

@@ -12,7 +12,7 @@ This playbook verifies transcript bundle restore behavior, including transcript 
 - Import validates artifact presence and checksums before writing.
 - Import restores `store.db` artifacts to `~/.cursor/chats/<mapped-workspace-key>/<conversation-id>/store.db`.
 - Import restores sidebar metadata JSON sidecars per conversation.
-- Import attempts to merge sidebar composer headers into local `state.vscdb` when payload and DB are available.
+- Import attempts to merge sidebar composer headers and optional composer data into local `state.vscdb` when payload and DB are available.
 - Import remains compatible with legacy `schemaVersion: 1` transcript manifests.
 
 ## Verification Workflow
@@ -30,7 +30,9 @@ This playbook verifies transcript bundle restore behavior, including transcript 
 11. Verify restored store path exists: `~/.cursor/chats/<mapped-workspace-key>/<conversation-id>/store.db`.
 12. Verify sidebar sidecar exists at `agent-transcripts/<conversation-id>/cursor-sidebar-metadata.json`.
 13. Inspect import completion output for `Restored: transcript files ..., store.db ..., sidebar JSON ..., state.vscdb merges ...`.
-14. If state merge is skipped/partial, confirm warning text explains why.
+14. If state merge succeeds, use the `Reload Window` action (or restart Cursor) and confirm imported visibility updates.
+15. If native composer rows are still missing, open the `Imported Transcripts` tree view and verify JSONL files can be opened directly.
+16. If state merge is skipped/partial, confirm warning text explains why.
 ## Pass Criteria
 
 - The exported manifest points to every selected transcript/store/sidebar artifact.
