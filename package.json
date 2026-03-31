@@ -17,7 +17,9 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onView:cursorSync.sidebar",
+    "onView:cursorSync.transcriptBrowser"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -36,6 +38,10 @@
           "id": "cursorSync.sidebar",
           "name": "Cursor Sync",
           "type": "webview"
+        },
+        {
+          "id": "cursorSync.transcriptBrowser",
+          "name": "Imported Transcripts"
         }
       ]
     },
@@ -44,6 +50,23 @@
         {
           "command": "cursorSync.syncNow",
           "when": "view == cursorSync.sidebar && cursorSync.configured",
+          "group": "navigation"
+        },
+        {
+          "command": "cursorSync.refreshImportedTranscripts",
+          "when": "view == cursorSync.transcriptBrowser",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "cursorSync.openImportedTranscript",
+          "when": "view == cursorSync.transcriptBrowser && viewItem == cursorSyncTranscriptFile",
+          "group": "inline"
+        },
+        {
+          "command": "cursorSync.revealImportedTranscriptInExplorer",
+          "when": "view == cursorSync.transcriptBrowser && viewItem == cursorSyncTranscriptFile",
           "group": "navigation"
         }
       ]
@@ -99,6 +122,19 @@
       {
         "command": "cursorSync.importTranscripts",
         "title": "Cursor Sync: Import Agent Transcripts from Private Gist"
+      },
+      {
+        "command": "cursorSync.refreshImportedTranscripts",
+        "title": "Cursor Sync: Refresh Imported Transcripts",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cursorSync.openImportedTranscript",
+        "title": "Cursor Sync: Open Imported Transcript"
+      },
+      {
+        "command": "cursorSync.revealImportedTranscriptInExplorer",
+        "title": "Cursor Sync: Reveal Imported Transcript in Explorer"
       }
     ],
     "configuration": {

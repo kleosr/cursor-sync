@@ -14,6 +14,7 @@ import { getLogger, loadSyncState } from "./diagnostics.js";
 import { initializeSidebar } from "./sidebar.js";
 import { initializeStatusBar, updateStatusBar } from "./statusbar.js";
 import { getOrCreateClientId } from "./analytics.js";
+import { initializeTranscriptBrowser } from "./transcript-browser.js";
 
 let configListener: vscode.Disposable | undefined;
 
@@ -21,6 +22,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const logger = getLogger();
 
   initializeStatusBar(context);
+  initializeTranscriptBrowser(context);
 
   context.subscriptions.push(
     vscode.commands.registerCommand("cursorSync.configureGithub", () =>
