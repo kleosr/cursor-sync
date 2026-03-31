@@ -14,6 +14,10 @@ export async function createBackup(
   context: vscode.ExtensionContext,
   filePaths: string[]
 ): Promise<{ backupDir: string; entries: BackupEntry[] }> {
+  if (filePaths.length === 0) {
+    return { backupDir: "", entries: [] };
+  }
+
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupDir = path.join(
     context.globalStorageUri.fsPath,
