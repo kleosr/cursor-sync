@@ -5,6 +5,8 @@ import { executePull } from "./pull.js";
 import { executeExport } from "./export.js";
 import { executeImport } from "./import.js";
 import { executeExportTranscripts, executeImportTranscripts } from "./transcripts.js";
+import { executeSaveChatLocal, executeLoadChatLocal } from "./chat-persistence.js";
+import { executeImportTranscriptsFromGist } from "./import-gist-transcripts.js";
 import { showStatus } from "./diagnostics.js";
 import { resolveConflictsCommand } from "./conflicts.js";
 import { executeReset } from "./reset.js";
@@ -15,6 +17,12 @@ import { initializeSidebar } from "./sidebar.js";
 import { initializeStatusBar, updateStatusBar } from "./statusbar.js";
 import { getOrCreateClientId } from "./analytics.js";
 import { initializeTranscriptBrowser } from "./transcript-browser.js";
+import {
+  executeFinalizeStateReconciliation,
+  executePrepareStateReconciliation,
+  notifyPendingStateBundleIfAny,
+} from "./state-reconciliation.js";
+import { executePrepareSyncFromLandingZone } from "./sync-engine.js";
 
 let configListener: vscode.Disposable | undefined;
 
@@ -85,8 +93,44 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("cursorSync.saveChatLocal", () =>
+      executeSaveChatLocal(context)
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorSync.loadChatLocal", () =>
+      executeLoadChatLocal(context)
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorSync.importTranscriptsFromGist", () =>
+      executeImportTranscriptsFromGist(context)
+    )
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand("cursorSync.syncNow", () =>
       executeSyncNow(context)
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorSync.prepareStateReconciliation", () =>
+      executePrepareStateReconciliation(context)
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorSync.finalizeStateReconciliation", () =>
+      executeFinalizeStateReconciliation(context)
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorSync.prepareSyncFromLandingZone", () =>
+      executePrepareSyncFromLandingZone(context)
     )
   );
 
@@ -108,6 +152,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
   context.subscriptions.push(configListener);
+
+  void notifyPendingStateBundleIfAny(context);
 
   logger.appendLine(`[${new Date().toISOString()}] Cursor Sync activated`);
 }

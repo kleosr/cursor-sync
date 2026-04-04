@@ -13,6 +13,7 @@ import { findMissingExtensions, findExtraExtensions } from "./extensions.js";
 import { updateStatusBar } from "./statusbar.js";
 import { refreshSidebar } from "./sidebar.js";
 import { sendEvent } from "./analytics.js";
+import { TRANSCRIPT_MANIFEST_FILE_NAME } from "./transcript-bundle.js";
 import type { SyncState, Manifest } from "./types.js";
 
 export type PullTrigger = "manual" | "scheduled";
@@ -131,7 +132,11 @@ async function doPull(
   const gistData = gistResult.data;
   const manifestFile = gistData.files["manifest.json"];
   if (!manifestFile) {
-    vscode.window.showErrorMessage("Pull failed: manifest.json not found in Gist.");
+    const message =
+      gistData.files[TRANSCRIPT_MANIFEST_FILE_NAME] !== undefined
+        ? "Pull failed: This Gist contains agent transcripts, not settings. Update the configured Gist to one from Cursor Sync export/push, or use Cursor Sync: Import Agent Transcripts from Private Gist."
+        : "Pull failed: manifest.json not found in Gist.";
+    vscode.window.showErrorMessage(message);
     logger.appendLine(`[${new Date().toISOString()}] Pull failed: missing manifest`);
     sendEvent(context, "sync_failed", { direction: "pull", reason: "missing_manifest", trigger });
     return false;

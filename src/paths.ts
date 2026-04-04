@@ -31,6 +31,8 @@ const DENYLIST_FILES = ["TransportSecurity"];
 
 const DENYLIST_GLOBS = ["Cookies*", "*.db", "*.db-journal", "*.db-wal", "*.log"];
 
+const MAX_SYNC_VSIX_BYTES = 50 * 1024 * 1024;
+
 export function resolveSyncRoots(
   platform: NodeJS.Platform = process.platform
 ): SyncRoots {
@@ -73,7 +75,8 @@ export async function enumerateSyncFiles(
       g === "settings.json" ||
       g === "keybindings.json" ||
       g === "extensions.json" ||
-      g.startsWith("snippets")
+      g.startsWith("snippets") ||
+      g.startsWith("vsix")
   );
   const dotCursorGlobs = enabledPaths.filter(
     (g) =>
@@ -137,7 +140,10 @@ async function collectFiles(
 
     try {
       const stat = await fs.stat(absPath);
-      if (stat.size > maxBytes) {
+      const sizeLimit = rel.toLowerCase().endsWith(".vsix")
+        ? MAX_SYNC_VSIX_BYTES
+        : maxBytes;
+      if (stat.size > sizeLimit) {
         continue;
       }
     } catch {
@@ -210,6 +216,7 @@ export function getDefaultEnabledPaths(): string[] {
     "keybindings.json",
     "snippets/**",
     "extensions.json",
+    "vsix/**",
     "skills/**",
     "skills-cursor/**/SKILL.md",
     "commands/**/*.md",

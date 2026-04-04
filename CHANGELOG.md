@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.9
+
+- feat: add default sync glob `vsix/**` under the Cursor `User` directory so packaged `.vsix` files are backed up with settings; each `.vsix` may be up to 50 MiB regardless of `cursorSync.maxFileSizeKB`.
+- feat: add `Cursor Sync: Save Chat Locally` and `Cursor Sync: Load Chat from Local Bundle` using a bundled golden SQLite template and manifest-driven hydration.
+- feat: add transcript import from a gist URL, state reconciliation commands for `chats.json`, and landing-zone preparation for sync.
+- feat: add sync manifest/engine layer, chat ID alignment, and composer payload merge helpers to support the above flows.
+
+## v0.4.6
+
+- fix: replace fake `workspaceIdentifier` in gist import with `stampWorkspaceIdentifierOnPayload` so imported chats match the real open workspace and appear in the sidebar.
+- chore: remove debug logging (`ultraDebugLog`) from gist import flow.
+
 ## v0.4.4
 
 - fix: implement deterministic transcript bundle v2 restore mapping with preflight validation for artifact integrity and store workspace resolution.

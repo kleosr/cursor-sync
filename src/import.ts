@@ -7,6 +7,7 @@ import { withRetry } from "./retry.js";
 import { getLogger } from "./diagnostics.js";
 import { resolveSyncRoots, gistFileNameToSyncKey } from "./paths.js";
 import { createBackup, rollbackFromBackup, pruneOldBackups } from "./rollback.js";
+import { TRANSCRIPT_MANIFEST_FILE_NAME } from "./transcript-bundle.js";
 import type { Manifest } from "./types.js";
 
 export async function executeImport(context: vscode.ExtensionContext): Promise<void> {
@@ -55,7 +56,11 @@ export async function executeImport(context: vscode.ExtensionContext): Promise<v
   const gistData = gistResult.data;
   const manifestFile = gistData.files["manifest.json"];
   if (!manifestFile) {
-    vscode.window.showErrorMessage("Import failed: manifest.json not found in Gist.");
+    const message =
+      gistData.files[TRANSCRIPT_MANIFEST_FILE_NAME] !== undefined
+        ? "Import failed: This Gist contains agent transcripts, not settings. Use the command Cursor Sync: Import Agent Transcripts from Private Gist."
+        : "Import failed: manifest.json not found in Gist.";
+    vscode.window.showErrorMessage(message);
     logger.appendLine(`[${new Date().toISOString()}] Import failed: missing manifest`);
     return;
   }

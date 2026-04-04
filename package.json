@@ -2,7 +2,7 @@
   "name": "cursor-sync",
   "displayName": "Cursor Sync",
   "description": "Sync user-level Cursor settings and assets to a private GitHub Gist",
-  "version": "0.4.4",
+  "version": "0.4.9",
   "icon": "assets/icon.png",
   "publisher": "MarceloBarella",
   "repository": {
@@ -124,6 +124,14 @@
         "title": "Cursor Sync: Import Agent Transcripts from Private Gist"
       },
       {
+        "command": "cursorSync.saveChatLocal",
+        "title": "Cursor Sync: Save Chat Locally"
+      },
+      {
+        "command": "cursorSync.loadChatLocal",
+        "title": "Cursor Sync: Load Chat from Local Bundle"
+      },
+      {
         "command": "cursorSync.refreshImportedTranscripts",
         "title": "Cursor Sync: Refresh Imported Transcripts",
         "icon": "$(refresh)"
@@ -135,6 +143,23 @@
       {
         "command": "cursorSync.revealImportedTranscriptInExplorer",
         "title": "Cursor Sync: Reveal Imported Transcript in Explorer"
+      },
+      {
+        "command": "cursorSync.importTranscriptsFromGist",
+        "title": "Cursor Sync: Import Transcripts from Gist URL",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "cursorSync.prepareStateReconciliation",
+        "title": "Cursor Sync: Prepare State Reconciliation (chats.json)"
+      },
+      {
+        "command": "cursorSync.finalizeStateReconciliation",
+        "title": "Cursor Sync: Finalize Pending State Reconciliation"
+      },
+      {
+        "command": "cursorSync.prepareSyncFromLandingZone",
+        "title": "Cursor Sync: Prepare Sync from Landing Zone"
       }
     ],
     "configuration": {
@@ -150,6 +175,7 @@
             "keybindings.json",
             "snippets/**",
             "extensions.json",
+            "vsix/**",
             "skills/**",
             "commands/**/*.md",
             "rules/*.mdc"
@@ -209,6 +235,16 @@
           "type": "number",
           "default": 2048,
           "description": "Skip transcript files larger than this size in KB"
+        },
+        "cursorSync.transcripts.importFallbackToCurrentWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "description": "When manual project mapping is empty, offer mapping all source projects to the local ~/.cursor/projects/ folder that matches the open workspace"
+        },
+        "cursorSync.transcripts.autoReloadAfterImport": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically reload Cursor after importing transcripts (skips the reload prompt)"
         }
       }
     }

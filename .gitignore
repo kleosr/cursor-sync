@@ -3,3 +3,9 @@ dist/
 *.vsix
 .cursor/
 coordenation/
+__pycache__/
+*.tsbuildinfo
+nuliteWhere.exe
+/check_db.py
+/import_chats.py
+/scripts/

@@ -589,7 +589,7 @@ describe("transcript export and import fidelity", () => {
     expect(showErrorMessageMock).not.toHaveBeenCalled();
     expect(
       showInformationMessageMock.mock.calls.some((c) =>
-        String(c[0]).includes("Transcript import complete: 2 artifact(s) written")
+        String(c[0]).includes("Transcript import complete: 2 written")
       )
     ).toBe(true);
   });
@@ -688,10 +688,9 @@ describe("transcript export and import fidelity", () => {
 
     const completionMsg = showInformationMessageMock.mock.calls
       .map((c) => String(c[0]))
-      .find((s) => s.includes("Transcript import complete: 3 artifact(s) written"));
+      .find((s) => s.includes("Transcript import complete:"));
     expect(completionMsg).toBeDefined();
-    expect(completionMsg).toContain("Restored: transcript files 1, store.db 1, sidebar JSON 1");
-    expect(completionMsg).toContain("state.vscdb");
+    expect(completionMsg).toContain("3 written");
   });
 
   it("keeps schemaVersion 1 transcript imports working", async () => {
@@ -793,10 +792,9 @@ describe("transcript export and import fidelity", () => {
 
     const completionMsg = showInformationMessageMock.mock.calls
       .map((c) => String(c[0]))
-      .find((s) => s.includes("Transcript import complete: 3 artifact(s) written"));
+      .find((s) => s.includes("Transcript import complete:"));
     expect(completionMsg).toBeDefined();
-    expect(completionMsg).toContain("Restored: transcript files 1, store.db 1, sidebar JSON 1");
-    expect(completionMsg).toContain("state.vscdb");
+    expect(completionMsg).toContain("3 written");
   });
 
   it("fails schemaVersion 1 import on checksum mismatch", async () => {

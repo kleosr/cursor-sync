@@ -1,6 +1,7 @@
 **
 !dist/extension.js
 !assets/icon.png
+!resources/golden-chat-store.template.db
 !package.json
 !README.md
 !CHANGELOG.md

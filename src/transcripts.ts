@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import * as crypto from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { GistClient } from "./gist.js";
@@ -31,6 +32,15 @@ import {
   type TranscriptManifestV1,
   type TranscriptManifestV2,
 } from "./transcript-bundle.js";
+import {
+  escapeSqlLiteral,
+  extractComposerDataPayload,
+  extractComposerHeadersPayload,
+  deriveComposerHeadersPayloadFromSidebarSnapshot,
+  getComposerId,
+  mergeComposerDataAdditive,
+  mergeComposerHeadersChain,
+} from "./composer-merge.js";
 
 export interface ProjectInfo {
   folderName: string;
@@ -52,7 +62,59 @@ const execFileWithInput = execFile as (
 ) => Promise<{ stdout: string; stderr: string }>;
 
 const SQLITE_SUBPROCESS_TIMEOUT_MS = 20_000;
+const SQLITE_BUSY_TIMEOUT_MS = 5000;
+const SQLITE_RETRY_BACKOFF_MS = 1_500;
 const FILE_ACCESS_TIMEOUT_MS = 12_000;
+const DELAYED_WRITEBACK_MS = 5_000;
+
+type DelayedWritebackHandle = {
+  timer: NodeJS.Timeout;
+  cancel: () => void;
+  complete: () => Promise<void>;
+};
+
+type PythonSqliteInterpreter = {
+  command: string;
+  argvPrefix: readonly string[];
+};
+
+let pythonInterpreterResolvePromise: Promise<PythonSqliteInterpreter> | null = null;
+
+async function probePythonInterpreter(): Promise<PythonSqliteInterpreter> {
+  const probe = "import sqlite3; raise SystemExit(0)";
+  const execOpts = { maxBuffer: 64 * 1024, timeout: 5000 };
+  const candidates: PythonSqliteInterpreter[] = [
+    { command: "python3", argvPrefix: [] },
+    { command: "python", argvPrefix: [] },
+  ];
+  if (process.platform === "win32") {
+    candidates.push({ command: "py", argvPrefix: ["-3"] });
+  }
+  for (const c of candidates) {
+    try {
+      const args = [...c.argvPrefix, "-c", probe];
+      await execFile(c.command, args, execOpts);
+      return c;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error(
+    "No Python with the sqlite3 module found (tried python3, python" +
+      (process.platform === "win32" ? ", py -3" : "") +
+      "). Install Python, add the SQLite CLI (sqlite3) to PATH, or both."
+  );
+}
+
+async function resolvePythonInterpreterForSqlite(): Promise<PythonSqliteInterpreter> {
+  if (!pythonInterpreterResolvePromise) {
+    pythonInterpreterResolvePromise = probePythonInterpreter().catch((err) => {
+      pythonInterpreterResolvePromise = null;
+      throw err;
+    });
+  }
+  return pythonInterpreterResolvePromise;
+}
 
 function isExecFileTimeoutError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
@@ -193,6 +255,49 @@ function humanLabel(folderName: string): string {
       ? parts.slice(0, -1)
       : parts;
   return withoutHash.join("-");
+}
+
+/**
+ * Match the open workspace folder to a Cursor project under ~/.cursor/projects/
+ * (same heuristics as manual mapping: folder name encodes path + hash).
+ */
+export function findProjectMatchingOpenWorkspaceFolder(
+  localProjects: ProjectInfo[],
+  workspaceFolders?: readonly vscode.WorkspaceFolder[]
+): ProjectInfo | undefined {
+  const folders = workspaceFolders ?? vscode.workspace.workspaceFolders;
+  if (!folders?.length || localProjects.length === 0) {
+    return undefined;
+  }
+  const base = path.basename(folders[0].uri.fsPath);
+  const lower = base.toLowerCase();
+  const exact = localProjects.filter((p) => p.label.toLowerCase() === lower);
+  if (exact.length === 1) {
+    return exact[0];
+  }
+  if (exact.length > 1) {
+    return exact.sort((a, b) => a.folderName.localeCompare(b.folderName))[0];
+  }
+  const loose = localProjects.filter(
+    (p) =>
+      p.label.toLowerCase().endsWith(lower) ||
+      p.folderName.toLowerCase().includes(lower)
+  );
+  if (loose.length === 1) {
+    return loose[0];
+  }
+  return undefined;
+}
+
+function buildFallbackProjectMapping(
+  sourceProjectKeys: string[],
+  target: ProjectInfo
+): Map<string, ProjectInfo> {
+  const m = new Map<string, ProjectInfo>();
+  for (const k of sourceProjectKeys) {
+    m.set(k, target);
+  }
+  return m;
 }
 
 export async function enumerateTranscriptFiles(
@@ -435,7 +540,7 @@ export async function executeImportTranscripts(
     return;
   }
 
-  const projectMapping = await promptForProjectMapping(
+  let projectMapping = await promptForProjectMapping(
     Object.keys(manifest.sourceProjects),
     Object.fromEntries(
       Object.entries(manifest.sourceProjects).map(([projectKey, info]) => [
@@ -452,8 +557,32 @@ export async function executeImportTranscripts(
   }
 
   if (projectMapping.size === 0) {
-    vscode.window.showInformationMessage("No projects mapped. Import cancelled.");
-    return;
+    const cfg = vscode.workspace.getConfiguration("cursorSync");
+    const allowFallback =
+      cfg.get<boolean>("transcripts.importFallbackToCurrentWorkspace") ?? true;
+    if (!allowFallback) {
+      vscode.window.showInformationMessage("No projects mapped. Import cancelled.");
+      return;
+    }
+    const target = findProjectMatchingOpenWorkspaceFolder(localProjects);
+    if (!target) {
+      vscode.window.showErrorMessage(
+        "No projects mapped. Open the correct repo folder in Cursor (File > Open Folder) so a ~/.cursor/projects/ entry matches this workspace, or map projects manually when prompted."
+      );
+      return;
+    }
+    const sourceKeys = Object.keys(manifest.sourceProjects).sort();
+    const confirm = await vscode.window.showWarningMessage(
+      `Map all ${sourceKeys.length} source project(s) from this Gist to this workspace’s Cursor project "${target.label}"?`,
+      { modal: true },
+      "Map all here",
+      "Cancel"
+    );
+    if (confirm !== "Map all here") {
+      vscode.window.showInformationMessage("Import cancelled.");
+      return;
+    }
+    projectMapping = buildFallbackProjectMapping(sourceKeys, target);
   }
 
   if (isTranscriptManifestV2(manifest)) {
@@ -1009,46 +1138,46 @@ async function previewAndApplyImportPlan(
 ): Promise<void> {
   const preview = await previewRestoreOperations(operations);
 
+  if (preview.newFiles.length === 0 && preview.conflicts.length === 0 && preview.unchanged.length === 0) {
+    vscode.window.showInformationMessage(
+      `${actionLabel} skipped: no artifacts selected.`
+    );
+    return;
+  }
+
   if (preview.newFiles.length === 0 && preview.conflicts.length === 0) {
     const sidebarOps = preview.unchanged.filter((op) => op.kind === "sidebar");
     if (options.importRestoreReport && sidebarOps.length > 0) {
       try {
-        const stateOutcome = await applySidebarStateRestoration(context, sidebarOps, logger);
-        const report = mergeStateOutcomeIntoReport(
-          {
-            transcriptWritten: 0,
-            storeWritten: 0,
-            sidebarWritten: 0,
-            stateDbMerged: 0,
-            stateDbSkippedNoPayload: 0,
-            stateDbSkippedNoDb: 0,
-            statePartial: false,
-            warnings: [],
-          },
-          stateOutcome
-        );
-        const warningParts = [
-          ...(options.warnings ?? []),
-          ...(report.warnings ?? []),
-        ];
-        const warningSuffix =
-          warningParts.length > 0 ? ` Warnings: ${warningParts.slice(0, 5).join(" ")}` : "";
-        const detailSuffix = ` State.vscdb merges ${report.stateDbMerged}. Skipped state merge (no composer payload) ${report.stateDbSkippedNoPayload}, (no DB) ${report.stateDbSkippedNoDb}.${report.statePartial ? " Partial state restoration." : ""}`;
+        const stateOutcome = await applySidebarStateRestoration(context, sidebarOps, logger, {
+          scheduleDelayedWriteback: true,
+        });
+        const sidebarMerged = stateOutcome.stateDbMerged > 0;
+
         vscode.window.showInformationMessage(
-          `Transcript import: artifacts already on disk; re-applied sidebar state.${detailSuffix}${warningSuffix}`
+          `Transcript import: ${preview.unchanged.length} unchanged${sidebarMerged ? ", sidebar updated" : ""}.`
         );
-        if (report.stateDbMerged > 0) {
-          const reloadAction = "Reload Window";
-          const selected = await vscode.window.showInformationMessage(
-            "Sidebar state was updated on disk. Reload Cursor to pick up imported conversation visibility.",
-            reloadAction
-          );
-          if (selected === reloadAction) {
+
+        if (sidebarMerged) {
+          const config = vscode.workspace.getConfiguration("cursorSync");
+          const autoReload = config.get<boolean>("transcripts.autoReloadAfterImport") ?? false;
+          if (autoReload) {
+            await stateOutcome.delayedWriteback?.complete();
             await vscode.commands.executeCommand("workbench.action.reloadWindow");
+          } else {
+            const reloadAction = "Reload Window";
+            const selected = await vscode.window.showInformationMessage(
+              "Sidebar updated. Reload Cursor to see imported conversations.",
+              reloadAction
+            );
+            if (selected === reloadAction) {
+              await stateOutcome.delayedWriteback?.complete();
+              await vscode.commands.executeCommand("workbench.action.reloadWindow");
+            }
           }
         }
         logger.appendLine(
-          `[${new Date().toISOString()}] Transcript import (unchanged files): stateMerged=${report.stateDbMerged} skippedPayload=${report.stateDbSkippedNoPayload} skippedDb=${report.stateDbSkippedNoDb}`
+          `[${new Date().toISOString()}] Transcript import (unchanged files): sidebarMerged=${stateOutcome.stateDbMerged} skippedPayload=${stateOutcome.stateDbSkippedNoPayload} skippedDb=${stateOutcome.stateDbSkippedNoDb} delayedWriteback=${stateOutcome.delayedWriteback ? "scheduled" : "none"}`
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1061,10 +1190,6 @@ async function previewAndApplyImportPlan(
       }
       return;
     }
-    vscode.window.showInformationMessage(
-      `${actionLabel} skipped: all selected artifacts are already up to date.`
-    );
-    return;
   }
 
   const summary = [
@@ -1104,72 +1229,101 @@ async function previewAndApplyImportPlan(
     }
   }
 
+  // Only write files that are new or have changed — skip unchanged (identical checksum)
   const toWrite = [
     ...preview.newFiles,
     ...(conflictPolicy === "overwrite" ? preview.conflicts : []),
   ].sort((a, b) => a.absolutePath.localeCompare(b.absolutePath));
 
-  if (toWrite.length === 0) {
+  // Sidebar ops from ALL categories (including unchanged) need state.vscdb merge
+  const allSidebarOps = [
+    ...preview.newFiles,
+    ...(conflictPolicy === "overwrite" ? preview.conflicts : []),
+    ...preview.unchanged,
+  ].filter((op) => op.kind === "sidebar");
+
+  if (toWrite.length === 0 && allSidebarOps.length === 0) {
     vscode.window.showInformationMessage(
-      `${actionLabel} skipped: conflicts were left untouched and the rest was already up to date.`
+      `${actionLabel}: everything already up to date.`
     );
     return;
   }
 
-  const result = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: `Writing ${toWrite.length} transcript artifact(s)...`,
-      cancellable: false,
-    },
-    async () => applyRestoreOperations(context, toWrite, logger)
-  );
+  let writtenCount = 0;
+  if (toWrite.length > 0) {
+    const result = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Writing ${toWrite.length} transcript artifact(s)...`,
+        cancellable: false,
+      },
+      async () => applyRestoreOperations(context, toWrite, logger)
+    );
 
-  if (!result.ok) {
-    vscode.window.showErrorMessage(result.message);
-    return;
+    if (!result.ok) {
+      vscode.window.showErrorMessage(result.message);
+      return;
+    }
+    writtenCount = result.writtenCount;
   }
 
-  let report: ImportRestoreReport | undefined;
-  if (options.importRestoreReport) {
-    const sidebarOps = toWrite.filter((op) => op.kind === "sidebar");
-    report = buildImportRestoreReportFromOperations(toWrite);
-    if (sidebarOps.length > 0) {
-      const stateOutcome = await applySidebarStateRestoration(context, sidebarOps, logger);
-      report = mergeStateOutcomeIntoReport(report, stateOutcome);
+  let sidebarMerged = false;
+  let delayedWritebackHandle: DelayedWritebackHandle | undefined;
+  if (options.importRestoreReport && allSidebarOps.length > 0) {
+    try {
+      const stateOutcome = await applySidebarStateRestoration(context, allSidebarOps, logger, {
+        scheduleDelayedWriteback: true,
+      });
+      sidebarMerged = stateOutcome.stateDbMerged > 0;
+      delayedWritebackHandle = stateOutcome.delayedWriteback;
+      if (stateOutcome.warnings.length > 0) {
+        for (const w of stateOutcome.warnings) {
+          logger.appendLine(`[${new Date().toISOString()}] [import] ${w}`);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.appendLine(`[${new Date().toISOString()}] [import] sidebar state merge failed: ${msg}`);
     }
   }
 
-  const warningParts = [
-    ...(options.warnings ?? []),
-    ...(report?.warnings ?? []),
-  ];
-  const warningSuffix =
-    warningParts.length > 0 ? ` Warnings: ${warningParts.slice(0, 5).join(" ")}` : "";
+  // Build a concise summary
+  const parts: string[] = [];
+  if (writtenCount > 0) parts.push(`${writtenCount} written`);
+  if (preview.unchanged.length > 0) parts.push(`${preview.unchanged.length} unchanged`);
+  const skipped = conflictPolicy === "skip" ? preview.conflicts.length : 0;
+  if (skipped > 0) parts.push(`${skipped} skipped`);
+  if (sidebarMerged) parts.push("sidebar updated");
 
-  const detailSuffix = report
-    ? ` Restored: transcript files ${report.transcriptWritten}, store.db ${report.storeWritten}, sidebar JSON ${report.sidebarWritten}, state.vscdb merges ${report.stateDbMerged}. Skipped state merge (no composer payload) ${report.stateDbSkippedNoPayload}, (no DB) ${report.stateDbSkippedNoDb}.${report.statePartial ? " Partial state/sidebar restoration." : ""}`
-    : "";
+  const warningParts = [...(options.warnings ?? [])];
+  const warningSuffix =
+    warningParts.length > 0 ? ` (${warningParts.length} warning${warningParts.length === 1 ? "" : "s"})` : "";
 
   vscode.window.showInformationMessage(
-    `Transcript import complete: ${result.writtenCount} artifact(s) written, ${preview.unchanged.length} unchanged, ` +
-      `${conflictPolicy === "skip" ? preview.conflicts.length : 0} conflict(s) skipped.${detailSuffix}${warningSuffix}`
+    `Transcript import complete: ${parts.join(", ")}.${warningSuffix}`
   );
-  if ((report?.stateDbMerged ?? 0) > 0) {
-    const reloadAction = "Reload Window";
-    const selected = await vscode.window.showInformationMessage(
-      "Sidebar state was updated on disk. Reload Cursor to pick up imported conversation visibility.",
-      reloadAction
-    );
-    if (selected === reloadAction) {
+
+  if (sidebarMerged) {
+    const config = vscode.workspace.getConfiguration("cursorSync");
+    const autoReload = config.get<boolean>("transcripts.autoReloadAfterImport") ?? false;
+    if (autoReload) {
+      await delayedWritebackHandle?.complete();
       await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    } else {
+      const reloadAction = "Reload Window";
+      const selected = await vscode.window.showInformationMessage(
+        "Sidebar updated. Reload Cursor to see imported conversations.",
+        reloadAction
+      );
+      if (selected === reloadAction) {
+        await delayedWritebackHandle?.complete();
+        await vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
     }
   }
+
   logger.appendLine(
-    `[${new Date().toISOString()}] Transcript import succeeded: ${result.writtenCount} artifacts` +
-      (report
-        ? `; transcript=${report.transcriptWritten} store=${report.storeWritten} sidebar=${report.sidebarWritten} stateMerged=${report.stateDbMerged}`
-        : "")
+    `[${new Date().toISOString()}] Transcript import succeeded: ${writtenCount} written, ${preview.unchanged.length} unchanged, sidebarMerged=${sidebarMerged} delayedWriteback=${delayedWritebackHandle ? "scheduled" : "none"}`
   );
 }
 
@@ -1282,7 +1436,15 @@ async function buildSidebarMetadataSnapshot(
       );
       const headerRaw = headerRows[0]?.value;
       if (headerRaw != null) {
-        composerHeadersRestore = coerceSqliteValue(headerRaw);
+        // Parse the full composerHeaders blob and extract only matching entries
+        // (coerceSqliteValue truncates at 4000 chars, destroying data for large blobs)
+        const fullHeadersParsed = parseFullComposerHeadersValue(headerRaw);
+        if (fullHeadersParsed) {
+          const filtered = filterComposerHeadersByIds(fullHeadersParsed, composerIds);
+          if (filtered.allComposers.length > 0) {
+            composerHeadersRestore = filtered;
+          }
+        }
       }
       const dataRows = await querySqliteRows(
         evidence.stateDbPath,
@@ -1290,8 +1452,10 @@ async function buildSidebarMetadataSnapshot(
       );
       const dataRaw = dataRows[0]?.value;
       if (dataRaw != null) {
-        const parsedComposerData = coerceSqliteValue(dataRaw);
-        composerDataRestore = filterComposerDataPayload(parsedComposerData, composerIds);
+        const parsedComposerData = parseFullJsonValue(dataRaw);
+        if (parsedComposerData && typeof parsedComposerData === "object" && !Array.isArray(parsedComposerData)) {
+          composerDataRestore = filterComposerDataPayload(parsedComposerData, composerIds);
+        }
       }
     } catch (error) {
       if (!isExecFileTimeoutError(error)) {
@@ -1562,6 +1726,7 @@ function buildFallbackComposerHeadersPayload(
   return {
     allComposers: [
       {
+        type: "head",
         composerId: conversationId,
         name: summary.title,
         subtitle: summary.subtitle,
@@ -1636,27 +1801,45 @@ async function extractSidebarStateEvidence(
   return undefined;
 }
 
-async function querySqliteRows(
+async function querySqliteRowsImpl(
+  runQuery: (dbPath: string, sql: string) => Promise<{ stdout: string; stderr: string }>,
   dbPath: string,
-  sql: string
+  sql: string,
+  opts?: { retries?: number }
 ): Promise<Array<Record<string, unknown>>> {
-  try {
-    const { stdout } = await runSqliteQuery(dbPath, sql);
-    const trimmed = stdout.trim();
-    if (!trimmed) {
-      return [];
-    }
+  const maxAttempts = opts?.retries ?? 1;
 
-    const parsed = JSON.parse(trimmed) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object")
-      : [];
-  } catch (error) {
-    if (isExecFileTimeoutError(error)) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const { stdout } = await runQuery(dbPath, sql);
+      const trimmed = stdout.trim();
+      if (!trimmed) {
+        return [];
+      }
+
+      const parsed = JSON.parse(trimmed) as unknown;
+      return Array.isArray(parsed)
+        ? parsed.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object")
+        : [];
+    } catch (error) {
+      if (isExecFileTimeoutError(error) && attempt < maxAttempts - 1) {
+        const delay = SQLITE_RETRY_BACKOFF_MS * Math.pow(2, attempt);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
       throw error;
     }
-    return [];
   }
+
+  throw new Error("querySqliteRowsImpl: exhausted retries without result");
+}
+
+async function querySqliteRows(
+  dbPath: string,
+  sql: string,
+  opts?: { retries?: number }
+): Promise<Array<Record<string, unknown>>> {
+  return querySqliteRowsImpl(runSqliteQuery, dbPath, sql, opts);
 }
 
 async function runSqliteQuery(
@@ -1678,20 +1861,25 @@ async function runSqliteQuery(
       "conn.row_factory = sqlite3.Row",
       "cur = conn.cursor()",
       "cur.execute(sql)",
-      "def _coerce(v):",
-      "    if isinstance(v, (bytes, bytearray, memoryview)):",
-      "        return bytes(v).hex()",
-      "    return v",
-      "rows = [{k: _coerce(r[k]) for k in r.keys()} for r in cur.fetchall()]",
+      "rows = [{k: (bytes(r[k]).hex() if isinstance(r[k], (bytes, bytearray, memoryview)) else r[k]) for k in r.keys()} for r in cur.fetchall()]",
       "print(json.dumps(rows))",
       "conn.close()",
     ].join(";");
-    return execFile("python3", ["-c", pyScript, dbPath, sql], execOpts);
+    const py = await resolvePythonInterpreterForSqlite();
+    const args = [...py.argvPrefix, "-c", pyScript, dbPath, sql];
+    return execFile(py.command, args, execOpts);
   }
 }
 
 async function runSqliteScript(dbPath: string, script: string): Promise<void> {
-  const execOpts = { input: script, maxBuffer: 64 * 1024 * 1024, timeout: SQLITE_SUBPROCESS_TIMEOUT_MS };
+  const scriptWithBusy = `PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};\n${script}`;
+  // Sanitize lone surrogates that would cause UnicodeEncodeError when piped to Python stdin
+  const sanitized = scriptWithBusy.replace(/[\ud800-\udfff]/g, "\ufffd");
+  const execOpts = {
+    input: sanitized,
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: SQLITE_SUBPROCESS_TIMEOUT_MS,
+  };
   try {
     await execFileWithInput("sqlite3", [dbPath], execOpts);
     return;
@@ -1702,14 +1890,23 @@ async function runSqliteScript(dbPath: string, script: string): Promise<void> {
     const pyScript = [
       "import sqlite3, sys",
       "db_path = sys.argv[1]",
-      "sql_script = sys.stdin.read()",
+      "sql_path = sys.argv[2]",
+      "sql_script = open(sql_path, 'r', encoding='utf-8').read()",
       "conn = sqlite3.connect(db_path)",
       "cur = conn.cursor()",
       "cur.executescript(sql_script)",
       "conn.commit()",
       "conn.close()",
     ].join(";");
-    await execFileWithInput("python3", ["-c", pyScript, dbPath], execOpts);
+    const py = await resolvePythonInterpreterForSqlite();
+    const tmpPath = path.join(os.tmpdir(), `cursor-sync-sql-${Date.now()}.sql`);
+    await fs.writeFile(tmpPath, sanitized, "utf-8");
+    const args = [...py.argvPrefix, "-c", pyScript, dbPath, tmpPath];
+    try {
+      await execFile(py.command, args, { maxBuffer: 64 * 1024 * 1024, timeout: SQLITE_SUBPROCESS_TIMEOUT_MS });
+    } finally {
+      await fs.unlink(tmpPath).catch(() => {});
+    }
   }
 }
 
@@ -1718,7 +1915,27 @@ function isCommandMissingError(error: unknown, command: string): boolean {
     return false;
   }
   const msg = error.message;
-  return msg.includes(`spawn ${command} ENOENT`) || msg.includes(`'${command}' not found`);
+  const lower = msg.toLowerCase();
+  const cmdLower = command.toLowerCase();
+  if (msg.includes(`spawn ${command} ENOENT`) || msg.includes(`spawn ${command} enoent`)) {
+    return true;
+  }
+  if (msg.includes(`'${command}'`) && (lower.includes("not found") || lower.includes("not recognized"))) {
+    return true;
+  }
+  if (
+    lower.includes(cmdLower) &&
+    (lower.includes("not recognized as an internal or external command") ||
+      lower.includes("is not recognized") ||
+      lower.includes("cannot find") ||
+      lower.includes("could not find"))
+  ) {
+    return true;
+  }
+  if (msg.includes("9009")) {
+    return true;
+  }
+  return false;
 }
 
 function coerceSqliteValue(value: unknown): unknown {
@@ -1733,18 +1950,107 @@ function coerceSqliteValue(value: unknown): unknown {
 
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      const serialized = JSON.stringify(parsed);
-      if (serialized.length > 4000) {
-        return `${serialized.slice(0, 4000)}…`;
-      }
-      return parsed;
+      return JSON.parse(trimmed) as unknown;
     } catch {
-      return trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}…` : trimmed;
+      // Not valid JSON — fall through to plain-string truncation
     }
   }
 
-  return trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}…` : trimmed;
+  return trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}...` : trimmed;
+}
+
+function parseFullJsonValue(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseFullComposerHeadersValue(
+  value: unknown
+): { allComposers: Array<Record<string, unknown>> } | undefined {
+  const parsed = parseFullJsonValue(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (!Array.isArray(obj.allComposers)) {
+    return undefined;
+  }
+  return {
+    allComposers: obj.allComposers.filter(
+      (c): c is Record<string, unknown> => Boolean(c) && typeof c === "object" && !Array.isArray(c)
+    ),
+  };
+}
+
+function filterComposerHeadersByIds(
+  headers: { allComposers: Array<Record<string, unknown>> },
+  composerIds: ReadonlySet<string>
+): { allComposers: Array<Record<string, unknown>> } {
+  return {
+    allComposers: headers.allComposers.filter((c) => {
+      const id = getComposerId(c);
+      return id.length > 0 && composerIds.has(id);
+    }),
+  };
+}
+
+function buildCurrentWorkspaceIdentifier(): Record<string, unknown> | undefined {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    return undefined;
+  }
+  const folder = folders[0]!;
+  const fsPath = folder.uri.fsPath;
+  return {
+    id: crypto.createHash("md5").update(fsPath).digest("hex"),
+    uri: {
+      $mid: 1,
+      fsPath,
+      _sep: process.platform === "win32" ? 1 : 47,
+      external: folder.uri.toString(),
+      path: folder.uri.path,
+      scheme: folder.uri.scheme,
+    },
+  };
+}
+
+function stampWorkspaceIdentifierOnPayload(
+  payload: Record<string, unknown>
+): Record<string, unknown> {
+  const list = Array.isArray(payload.allComposers) ? payload.allComposers : [];
+  const needsStamp = list.some(
+    (c) => c && typeof c === "object" && !Array.isArray(c) && !(c as Record<string, unknown>).workspaceIdentifier
+  );
+  if (!needsStamp) {
+    return payload;
+  }
+  const wsId = buildCurrentWorkspaceIdentifier();
+  if (!wsId) {
+    return payload;
+  }
+  return {
+    ...payload,
+    allComposers: list.map((c) => {
+      if (!c || typeof c !== "object" || Array.isArray(c)) {
+        return c;
+      }
+      const rec = c as Record<string, unknown>;
+      if (rec.workspaceIdentifier) {
+        return rec;
+      }
+      return { ...rec, workspaceIdentifier: wsId };
+    }),
+  };
 }
 
 async function resolveStateDbCandidates(): Promise<string[]> {
@@ -2031,12 +2337,33 @@ function buildImportRestoreReportFromOperations(operations: RestoreOperation[]):
   };
 }
 
+function countArtifactKinds(operations: RestoreOperation[]): {
+  transcript: number;
+  store: number;
+  sidebar: number;
+} {
+  let transcript = 0;
+  let store = 0;
+  let sidebar = 0;
+  for (const o of operations) {
+    if (o.kind === "transcript") {
+      transcript += 1;
+    } else if (o.kind === "store") {
+      store += 1;
+    } else if (o.kind === "sidebar") {
+      sidebar += 1;
+    }
+  }
+  return { transcript, store, sidebar };
+}
+
 interface StateRestoreOutcome {
   stateDbMerged: number;
   stateDbSkippedNoPayload: number;
   stateDbSkippedNoDb: number;
   statePartial: boolean;
   warnings: string[];
+  delayedWriteback?: DelayedWritebackHandle;
 }
 
 function mergeStateOutcomeIntoReport(
@@ -2050,264 +2377,6 @@ function mergeStateOutcomeIntoReport(
     stateDbSkippedNoDb: state.stateDbSkippedNoDb,
     statePartial: base.statePartial || state.statePartial,
     warnings: [...base.warnings, ...state.warnings],
-  };
-}
-
-function escapeSqlLiteral(value: string): string {
-  return value.replace(/'/g, "''");
-}
-
-function parseComposerHeadersBlob(raw: string | undefined): {
-  allComposers: Array<Record<string, unknown>>;
-} {
-  if (!raw) {
-    return { allComposers: [] };
-  }
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      !Array.isArray(parsed) &&
-      Array.isArray((parsed as Record<string, unknown>).allComposers)
-    ) {
-      return {
-        allComposers: (parsed as { allComposers: Array<Record<string, unknown>> }).allComposers,
-      };
-    }
-  } catch {}
-  return { allComposers: [] };
-}
-
-function getComposerId(record: Record<string, unknown>): string {
-  const id = record.composerId;
-  return typeof id === "string" && id.length > 0 ? id : "";
-}
-
-function mergeComposerHeadersAdditive(
-  existing: { allComposers: Array<Record<string, unknown>> },
-  imported: Record<string, unknown>
-): { allComposers: Array<Record<string, unknown>> } {
-  const byId = new Map<string, Record<string, unknown>>();
-  for (const c of existing.allComposers) {
-    const id = getComposerId(c);
-    if (id) {
-      byId.set(id, { ...c });
-    }
-  }
-  const importedList = Array.isArray(imported.allComposers) ? imported.allComposers : [];
-  for (const c of importedList) {
-    if (!c || typeof c !== "object" || Array.isArray(c)) {
-      continue;
-    }
-    const rec = c as Record<string, unknown>;
-    const id = getComposerId(rec);
-    if (!id || byId.has(id)) {
-      continue;
-    }
-    byId.set(id, { ...rec });
-  }
-  return { allComposers: [...byId.values()] };
-}
-
-function mergeComposerHeadersChain(
-  existingRaw: string | undefined,
-  importedPayloads: Array<Record<string, unknown>>
-): { allComposers: Array<Record<string, unknown>> } {
-  let acc = parseComposerHeadersBlob(existingRaw);
-  for (const imp of importedPayloads) {
-    acc = mergeComposerHeadersAdditive(acc, imp);
-  }
-  return acc;
-}
-
-function extractComposerHeadersPayload(
-  parsed: Record<string, unknown>
-): Record<string, unknown> | undefined {
-  const ch = parsed.composerHeaders;
-  if (ch && typeof ch === "object" && !Array.isArray(ch)) {
-    return ch as Record<string, unknown>;
-  }
-  const cr = parsed.composerHeadersRestore;
-  if (cr && typeof cr === "object" && !Array.isArray(cr)) {
-    return cr as Record<string, unknown>;
-  }
-  const rows = parsed.matchedItemTableRows;
-  if (Array.isArray(rows)) {
-    for (const row of rows) {
-      if (!row || typeof row !== "object" || Array.isArray(row)) {
-        continue;
-      }
-      const rec = row as Record<string, unknown>;
-      if (rec.key !== "composer.composerHeaders") {
-        continue;
-      }
-      const v = rec.value;
-      if (typeof v === "string") {
-        const t = v.trim();
-        if (t.endsWith("…") || t.endsWith("...")) {
-          return undefined;
-        }
-        try {
-          const parsedInner = JSON.parse(t) as unknown;
-          if (parsedInner && typeof parsedInner === "object" && !Array.isArray(parsedInner)) {
-            return parsedInner as Record<string, unknown>;
-          }
-        } catch {
-          return undefined;
-        }
-      }
-      if (v && typeof v === "object" && !Array.isArray(v)) {
-        return v as Record<string, unknown>;
-      }
-    }
-  }
-  return undefined;
-}
-
-function extractComposerDataPayload(
-  parsed: Record<string, unknown>
-): Record<string, unknown> | undefined {
-  const direct = parsed.composerData;
-  if (direct && typeof direct === "object" && !Array.isArray(direct)) {
-    return direct as Record<string, unknown>;
-  }
-  const restore = parsed.composerDataRestore;
-  if (restore && typeof restore === "object" && !Array.isArray(restore)) {
-    return restore as Record<string, unknown>;
-  }
-  const rows = parsed.matchedItemTableRows;
-  if (!Array.isArray(rows)) {
-    return undefined;
-  }
-  for (const row of rows) {
-    if (!row || typeof row !== "object" || Array.isArray(row)) {
-      continue;
-    }
-    const rec = row as Record<string, unknown>;
-    if (rec.key !== "composer.composerData") {
-      continue;
-    }
-    const v = rec.value;
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      return v as Record<string, unknown>;
-    }
-    if (typeof v !== "string") {
-      continue;
-    }
-    const t = v.trim();
-    if (t.endsWith("…") || t.endsWith("...")) {
-      return undefined;
-    }
-    try {
-      const parsedInner = JSON.parse(t) as unknown;
-      if (parsedInner && typeof parsedInner === "object" && !Array.isArray(parsedInner)) {
-        return parsedInner as Record<string, unknown>;
-      }
-    } catch {
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
-function mergeComposerDataAdditive(
-  existingRaw: string | undefined,
-  importedPayloads: Array<Record<string, unknown>>
-): Record<string, unknown> {
-  const parseBlob = (raw: string | undefined): Record<string, unknown> => {
-    if (!raw || raw.trim().length === 0) {
-      return {};
-    }
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {}
-    return {};
-  };
-
-  const mergeComposerArray = (
-    baseValue: unknown,
-    importedValue: unknown
-  ): Array<Record<string, unknown>> | undefined => {
-    if (!Array.isArray(baseValue) || !Array.isArray(importedValue)) {
-      return undefined;
-    }
-    const byId = new Map<string, Record<string, unknown>>();
-    for (const entry of baseValue) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        continue;
-      }
-      const rec = entry as Record<string, unknown>;
-      const id = getComposerId(rec);
-      if (id) {
-        byId.set(id, { ...rec });
-      }
-    }
-    for (const entry of importedValue) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-        continue;
-      }
-      const rec = entry as Record<string, unknown>;
-      const id = getComposerId(rec);
-      if (!id || byId.has(id)) {
-        continue;
-      }
-      byId.set(id, { ...rec });
-    }
-    return [...byId.values()];
-  };
-
-  let merged = parseBlob(existingRaw);
-  for (const imported of importedPayloads) {
-    const next: Record<string, unknown> = { ...merged };
-    for (const [key, value] of Object.entries(imported)) {
-      if (!(key in next)) {
-        next[key] = value;
-        continue;
-      }
-      const mergedArray = mergeComposerArray(next[key], value);
-      if (mergedArray) {
-        next[key] = mergedArray;
-      }
-    }
-    merged = next;
-  }
-  return merged;
-}
-
-function deriveComposerHeadersPayloadFromSidebarSnapshot(
-  parsed: Record<string, unknown>
-): Record<string, unknown> | undefined {
-  const conversationId = parsed.conversationId;
-  if (typeof conversationId !== "string" || conversationId.trim().length === 0) {
-    return undefined;
-  }
-  const title = typeof parsed.title === "string" && parsed.title.trim().length > 0
-    ? parsed.title
-    : conversationId;
-  const subtitle = typeof parsed.subtitle === "string" ? parsed.subtitle : "";
-  const rawTimestamp = parsed.lastUpdatedAt;
-  const timestamp =
-    typeof rawTimestamp === "string" && rawTimestamp.trim().length > 0
-      ? rawTimestamp
-      : new Date().toISOString();
-  return {
-    allComposers: [
-      {
-        composerId: conversationId,
-        name: title,
-        subtitle,
-        lastUpdatedAt: timestamp,
-        lastOpenedAt: timestamp,
-        createdAt: timestamp,
-        hasUnreadMessages: false,
-        isArchived: false,
-        isDraft: false,
-      },
-    ],
   };
 }
 
@@ -2334,7 +2403,8 @@ async function resolveSidebarImportStateDbPaths(
 async function applySidebarStateRestoration(
   context: vscode.ExtensionContext,
   sidebarOps: RestoreOperation[],
-  logger: ReturnType<typeof getLogger>
+  logger: ReturnType<typeof getLogger>,
+  options?: { scheduleDelayedWriteback?: boolean }
 ): Promise<StateRestoreOutcome> {
   const outcome: StateRestoreOutcome = {
     stateDbMerged: 0,
@@ -2394,7 +2464,9 @@ async function applySidebarStateRestoration(
       conversationIds: [],
     };
     if (effectiveHeadersPayload) {
-      agg.headerPayloads.push(effectiveHeadersPayload);
+      // Ensure imported entries have workspaceIdentifier for the current workspace
+      const stamped = stampWorkspaceIdentifierOnPayload(effectiveHeadersPayload);
+      agg.headerPayloads.push(stamped);
     }
     if (dataPayload) {
       agg.dataPayloads.push(dataPayload);
@@ -2404,6 +2476,13 @@ async function applySidebarStateRestoration(
     }
     byDb.set(dbPath, agg);
   }
+
+  const delayedWritebackTargets: Array<{
+    dbPath: string;
+    mergedHeadersJson: string;
+    mergedDataJson: string | null;
+    agg: Agg;
+  }> = [];
 
   for (const [dbPath, agg] of byDb) {
     let existingHeadersRaw: string | undefined;
@@ -2468,6 +2547,15 @@ async function applySidebarStateRestoration(
       logger.appendLine(
         `[${new Date().toISOString()}] Merged composer state in ${dbPath} for ${agg.conversationIds.join(",")}`
       );
+
+      if (options?.scheduleDelayedWriteback) {
+        delayedWritebackTargets.push({
+          dbPath,
+          mergedHeadersJson,
+          mergedDataJson: agg.dataPayloads.length > 0 ? mergedDataJson : null,
+          agg,
+        });
+      }
     } catch (error) {
       await rollbackFromBackup(backupEntries);
       outcome.warnings.push(
@@ -2475,6 +2563,70 @@ async function applySidebarStateRestoration(
       );
       outcome.statePartial = true;
     }
+  }
+
+  if (delayedWritebackTargets.length > 0) {
+    const targets = delayedWritebackTargets;
+    let completed = false;
+    let resolveCompletion: (() => void) | undefined;
+
+    const runWriteback = async () => {
+      for (const target of targets) {
+        try {
+          const escapedHeaders = escapeSqlLiteral(target.mergedHeadersJson);
+          const headerScript =
+            `UPDATE ItemTable SET value = '${escapedHeaders}' WHERE key = 'composer.composerHeaders';\n` +
+            `INSERT INTO ItemTable (key, value) SELECT 'composer.composerHeaders', '${escapedHeaders}' WHERE NOT EXISTS (SELECT 1 FROM ItemTable WHERE key = 'composer.composerHeaders');\n`;
+          const dataScript = target.mergedDataJson
+            ? (() => {
+                const escapedData = escapeSqlLiteral(target.mergedDataJson!);
+                return (
+                  `UPDATE ItemTable SET value = '${escapedData}' WHERE key = 'composer.composerData';\n` +
+                  `INSERT INTO ItemTable (key, value) SELECT 'composer.composerData', '${escapedData}' WHERE NOT EXISTS (SELECT 1 FROM ItemTable WHERE key = 'composer.composerData');\n`
+                );
+              })()
+            : "";
+          const script = `BEGIN IMMEDIATE;\n${headerScript}${dataScript}COMMIT;\n`;
+          await runSqliteScript(target.dbPath, script);
+          logger.appendLine(
+            `[${new Date().toISOString()}] Delayed write-back succeeded for ${target.dbPath} (${target.agg.conversationIds.join(",")})`
+          );
+        } catch (error) {
+          logger.appendLine(
+            `[${new Date().toISOString()}] Delayed write-back failed for ${target.dbPath}: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+    };
+
+    const completionPromise = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+
+    const timer = setTimeout(async () => {
+      if (!completed) {
+        completed = true;
+        await runWriteback();
+        resolveCompletion?.();
+      }
+    }, DELAYED_WRITEBACK_MS);
+
+    outcome.delayedWriteback = {
+      timer,
+      cancel: () => {
+        completed = true;
+        clearTimeout(timer);
+        resolveCompletion?.();
+      },
+      complete: async () => {
+        if (!completed) {
+          completed = true;
+          clearTimeout(timer);
+          await runWriteback();
+        }
+        await completionPromise;
+      },
+    };
   }
 
   return outcome;
@@ -2546,4 +2698,23 @@ export const __transcriptsTestUtils = {
   extractComposerDataPayload,
   mergeComposerHeadersChain,
   mergeComposerDataAdditive,
+  isCommandMissingError,
+  querySqliteRowsImpl,
+};
+
+export const __chatPersistenceInternals = {
+  runSqliteQuery,
+  runSqliteScript,
+  querySqliteRows,
+  resolveStateDbCandidates,
+  resolveChatsRoot,
+  findStoreDbForConversation,
+  escapeSqlLiteral,
+  mergeComposerHeadersChain,
+  mergeComposerDataAdditive,
+  extractComposerHeadersPayload,
+  extractComposerDataPayload,
+  deriveComposerHeadersPayloadFromSidebarSnapshot,
+  stampWorkspaceIdentifierOnPayload,
+  isExecFileTimeoutError,
 };

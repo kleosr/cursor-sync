@@ -112,6 +112,19 @@ describe("transcripts", () => {
     });
   });
 
+  describe("findProjectMatchingOpenWorkspaceFolder", () => {
+    it("matches local project when workspace basename equals label", async () => {
+      const { findProjectMatchingOpenWorkspaceFolder } = await import("../src/transcripts.js");
+      const projects = [
+        { folderName: "other-hash", fullPath: "/p/other", label: "other" },
+        { folderName: "myapp-hash12", fullPath: "/p/myapp", label: "myapp" },
+      ];
+      const ws = [{ uri: { fsPath: "C:\\projects\\myapp" } }] as import("vscode").WorkspaceFolder[];
+      const r = findProjectMatchingOpenWorkspaceFolder(projects, ws);
+      expect(r?.label).toBe("myapp");
+    });
+  });
+
   describe("sidebar state helpers", () => {
     it("extracts composerData payload from sidebar snapshot object", async () => {
       const { __transcriptsTestUtils } = await import("../src/transcripts.js");

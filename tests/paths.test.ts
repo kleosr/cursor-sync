@@ -91,6 +91,7 @@ describe("paths", () => {
       const dotCursor = path.join(tmpDir, "dotCursor");
 
       await fs.mkdir(path.join(cursorUser, "snippets"), { recursive: true });
+      await fs.mkdir(path.join(cursorUser, "vsix"), { recursive: true });
       await fs.mkdir(path.join(dotCursor, "rules"), { recursive: true });
       await fs.mkdir(path.join(dotCursor, "skills", "coding"), { recursive: true });
       await fs.mkdir(path.join(dotCursor, "extensions"), { recursive: true });
@@ -102,6 +103,7 @@ describe("paths", () => {
         path.join(cursorUser, "snippets", "ts.json"),
         "{}"
       );
+      await fs.writeFile(path.join(cursorUser, "vsix", "sample.vsix"), "PK\u0003\u0004");
       await fs.writeFile(
         path.join(dotCursor, "rules", "test.mdc"),
         "rule"
@@ -137,6 +139,7 @@ describe("paths", () => {
       expect(keys).toContain("cursor-user/settings.json");
       expect(keys).toContain("cursor-user/keybindings.json");
       expect(keys).toContain("cursor-user/snippets/ts.json");
+      expect(keys).toContain("cursor-user/vsix/sample.vsix");
       expect(keys).toContain("dot-cursor/rules/test.mdc");
       expect(keys).toContain("dot-cursor/skills/coding/SKILL.md");
       expect(keys).toContain("dot-cursor/skills/coding/template.txt");
@@ -159,6 +162,22 @@ describe("paths", () => {
       const keys = files.map((f) => f.relativeSyncKey);
 
       expect(keys).not.toContain("cursor-user/settings.json");
+    });
+
+    it("allows .vsix files larger than maxFileSizeKB", async () => {
+      await fs.mkdir(path.join(tmpDir, "cursorUser", "vsix"), { recursive: true });
+      const vsixPath = path.join(tmpDir, "cursorUser", "vsix", "big.vsix");
+      await fs.writeFile(vsixPath, Buffer.alloc(600 * 1024, "y"));
+
+      const { enumerateSyncFiles } = await import("../src/paths.js");
+      const roots = {
+        cursorUser: path.join(tmpDir, "cursorUser"),
+        dotCursor: path.join(tmpDir, "dotCursor"),
+      };
+      const files = await enumerateSyncFiles(roots);
+      const keys = files.map((f) => f.relativeSyncKey);
+
+      expect(keys).toContain("cursor-user/vsix/big.vsix");
     });
   });
 });
