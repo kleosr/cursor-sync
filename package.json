@@ -227,7 +227,7 @@
     "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^4.1.11"
   },
   "dependencies": {
     "minimatch": "^10.0.0"
